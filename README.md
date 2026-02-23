@@ -1,5 +1,5 @@
 # AI Change Governance Platform — Ansible Edition
-## Setup Guide: Oracle Cloud → Ansible → Claude → ServiceNow
+## Setup Guide: Oracle Cloud → Ansible → OPENAI → ServiceNow
 
 ---
 
@@ -146,7 +146,7 @@ your-repo/
 
 ### 3c. Secrets to set
 ```toml
-ANTHROPIC_API_KEY       = "sk-ant-..."
+OPENAI_API_KEY       = "sk-ant-..."
 SERVICENOW_INSTANCE     = "dev12345.service-now.com"
 SERVICENOW_USER         = "admin"
 SERVICENOW_PASS         = "..."
@@ -186,7 +186,7 @@ Managed Node does NOT need a public IP — only a private IP is needed since Ans
 | 1 | Create Change | ServiceNow POST → CHGxxxxxxx |
 | 2 | Run Pre-Check | SSH → Control → `pre_health_check.yml` → Managed Node → JSON |
 | 3 | Execute Change | SSH → Control → `apply_change.yml -e scenario=X` → Managed Node |
-| 4 | Run Post-Check + Validate | `post_health_check.yml` → diff → Claude AI → ServiceNow PATCH |
+| 4 | Run Post-Check + Validate | `post_health_check.yml` → diff → OPENAI AI → ServiceNow PATCH |
 | — | Cleanup | SSH → Control → kill pids, rm files on Managed Node |
 
 ### Scenario outcomes

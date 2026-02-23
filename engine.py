@@ -6,11 +6,11 @@ Architecture:
                                └─ ansible-playbook ──▶ Managed Node (Oracle VM #2)
                                                             └─ health JSON written
                                └─ engine.py reads JSON back over SSH
-                               └─ Claude AI validates
+                               └─ OPENAI AI validates
                                └─ ServiceNow updated
 
 Streamlit Secrets required:
-  ANTHROPIC_API_KEY
+  OPENAI_API_KEY
   SERVICENOW_INSTANCE       e.g. dev12345.service-now.com
   SERVICENOW_USER
   SERVICENOW_PASS
@@ -24,7 +24,7 @@ import json
 import os
 import time
 import requests
-import anthropic
+from openai import OpenAI
 import paramiko
 import streamlit as st
 from datetime import datetime
@@ -153,7 +153,7 @@ def create_change() -> dict:
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json={
             "short_description": "AI-Governed Linux Change (Ansible)",
-            "description":       "Automated Ansible pre/post health validation via Claude AI.",
+            "description":       "Automated Ansible pre/post health validation via OPENAI AI.",
             "type":              "normal",
             "state":             "-5",
         },
@@ -374,15 +374,15 @@ def risk_score(diff: dict) -> dict:
 
 def ai_validate(pre: dict, post: dict, diff: dict, risk: dict, change_info: dict) -> dict:
     """
-    Send Ansible playbook outputs + diff + risk model to Claude.
-    Claude parses the structured JSON, validates the change, and returns
+    Send Ansible playbook outputs + diff + risk model to OPENAI.
+    OPENAI parses the structured JSON, validates the change, and returns
     PASS or FAIL with a full SRE-style analysis for ServiceNow work notes.
     """
-    api_key = _secret("ANTHROPIC_API_KEY")
+    api_key = _secret("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY missing from Streamlit secrets.")
+        raise RuntimeError("OPENAI_API_KEY missing from Streamlit secrets.")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     system = """You are a senior Site Reliability Engineer validating a Linux system change.
 You receive structured output from Ansible health-check playbooks and a risk model.
@@ -445,14 +445,16 @@ End with exactly one of:
 
 If FAIL — list the specific issues that must be resolved before closing the change."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=1500,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    text    = response.content[0].text
+    text    = response.choices[0].message.content or ""
     verdict = "PASS" if "VALIDATION: PASS" in text.upper() else "FAIL"
 
     # Extract ServiceNow work notes section
@@ -468,7 +470,7 @@ If FAIL — list the specific issues that must be resolved before closing the ch
         "full_analysis": text,
         "sn_notes":     sn_notes,
         "model":        response.model,
-        "tokens":       response.usage.input_tokens + response.usage.output_tokens,
+        "tokens":       (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0),
     }
 
 

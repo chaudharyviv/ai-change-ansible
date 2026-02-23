@@ -1,5 +1,5 @@
 """
-app.py — AI Change Governance Platform (Ansible Edition)
+app.py — AI Change Governance Platform
 =========================================================
 Streamlit UI — zero system calls here.
 All execution happens on Oracle VMs via engine.py.
@@ -24,7 +24,7 @@ st.set_page_config(
 )
 
 st.title("🧠 AI Change Governance Platform")
-st.caption("Ansible Playbooks · Claude AI · ServiceNow PDI · Oracle Cloud")
+st.caption("Ansible Playbooks · OPENAI · ServiceNow PDI · Oracle Cloud")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE
@@ -221,7 +221,7 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.header("4️⃣ Post-Check + AI Validation")
-st.caption("Runs `post_health_check.yml`, computes diff, sends to Claude, updates ServiceNow.")
+st.caption("Runs `post_health_check.yml`, computes diff, sends to OPENAI, updates ServiceNow.")
 
 if st.session_state.change_applied is None:
     st.warning("⬆️ Complete Step 3 first.")
@@ -242,7 +242,7 @@ else:
             st.session_state.diff = diff
             st.session_state.risk = risk
 
-        with st.spinner("Sending Ansible output to Claude AI..."):
+        with st.spinner("Sending Ansible output to OPENAI AI..."):
             try:
                 final = ai_validate(
                     st.session_state.pre,
@@ -322,12 +322,12 @@ if st.session_state.final:
             after_icon  = "🟢" if change["after"]  == "active" else "🔴"
             st.write(f"`{svc}`: {before_icon} {change['before']} → {after_icon} {change['after']}")
 
-    # ServiceNow work notes (what Claude wrote for SN)
+    # ServiceNow work notes (what OPENAI wrote for SN)
     with st.expander("📝 ServiceNow Work Notes (AI-generated)", expanded=True):
         st.info(st.session_state.final["sn_notes"])
 
     # Full AI analysis
-    with st.expander("🤖 Full Claude AI Analysis"):
+    with st.expander("🤖 Full OPENAI AI Analysis"):
         st.markdown(st.session_state.final["full_analysis"])
 
     # Ansible stdout from post-check
