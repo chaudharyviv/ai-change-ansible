@@ -39,20 +39,28 @@ from datetime import datetime
 
 # ── Secrets helper ────────────────────────────────────────────────────────────
 
+# ── Secrets helper ────────────────────────────────────────────────────────────
+
 def _secret(key: str) -> str:
     try:
         return st.secrets[key]
     except Exception:
         return os.getenv(key, "")
 
+
+# ── Workflow IDs ──────────────────────────────────────────────────────────────
+# Using numeric IDs avoids 404s from filename-based dispatch on some PAT configs.
+# Get yours from: https://api.github.com/repos/OWNER/REPO/actions/workflows
+
 _WORKFLOW_IDS = {
-    "pre_health_check.yml": "237876997",
-    "apply_change.yml":     "237876994",
-    "post_health_check.yml": "237876991",
-    "cleanup.yml":          "237876988",
+    "pre_health_check.yml":  "237876997",
+    "apply_change.yml":      "237876994",
+    "post_health_check.yml": "237876996",
+    "cleanup.yml":           "237876995",
+}
 
 
-# ── GitHub API base ───────────────────────────────────────────────────────────
+# ── GitHub API helpers ────────────────────────────────────────────────────────
 
 def _gh_headers() -> dict:
     token = _secret("GITHUB_PAT")
@@ -76,16 +84,18 @@ def _repo() -> str:
 # GITHUB ACTIONS — trigger, poll, download
 # ══════════════════════════════════════════════════════════════════════════════
 
-def trigger_workflow(workflow_id: str, inputs: dict) -> str:
+def trigger_workflow(workflow_filename: str, inputs: dict) -> str:
     """
     Dispatch a workflow_dispatch event to GitHub Actions.
-    Returns the run_id of the triggered run (fetched immediately after dispatch).
+    Uses numeric workflow ID to avoid 404s from filename-based dispatch.
+    Returns the run_id of the triggered run.
     """
-    repo    = _repo()
-    headers = _gh_headers()
-    before_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
+    repo        = _repo()
+    headers     = _gh_headers()
     workflow_id = _WORKFLOW_IDS.get(workflow_filename, workflow_filename)
+
+    # Record time just before dispatch so we can find this specific run
+    before_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
@@ -94,24 +104,26 @@ def trigger_workflow(workflow_id: str, inputs: dict) -> str:
         timeout=15,
     )
     if r.status_code != 204:
-        raise RuntimeError(f"GitHub dispatch failed ({r.status_code}): {r.text}")
+        raise RuntimeError(
+            f"GitHub dispatch failed ({r.status_code}): {r.text}"
+        )
 
+    # Give GitHub 3s to register the run, then find its run_id
     time.sleep(3)
-    run_id = _find_run_id(workflow_filename, before_ts)
-    return run_id
-
-
+    return _find_run_id(workflow_filename, before_ts)
 def _find_run_id(workflow_filename: str, created_after: str) -> str:
     """
     Find the run_id of the most recently triggered run for a workflow.
     Retries for up to 30 seconds in case GitHub is slow to register it.
+    Uses numeric workflow ID for consistency.
     """
-    repo    = _repo()
-    headers = _gh_headers()
+    repo        = _repo()
+    headers     = _gh_headers()
+    workflow_id = _WORKFLOW_IDS.get(workflow_filename, workflow_filename)
 
     for _ in range(10):
         r = requests.get(
-            f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_filename}/runs",
+            f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/runs",
             headers=headers,
             params={"per_page": 5, "created": f">={created_after}"},
             timeout=15,
@@ -131,13 +143,12 @@ def _find_run_id(workflow_filename: str, created_after: str) -> str:
 def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> dict:
     """
     Poll GitHub Actions until the run completes or timeout is reached.
-    Returns the full run object with status and conclusion.
     Shows a Streamlit progress bar while waiting.
+    Returns the full run object with status and conclusion.
     """
-    repo    = _repo()
-    headers = _gh_headers()
-    start   = time.time()
-
+    repo     = _repo()
+    headers  = _gh_headers()
+    start    = time.time()
     progress = st.progress(0, text="GitHub Actions running...")
     elapsed  = 0
 
@@ -148,8 +159,7 @@ def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        run = r.json()
-
+        run        = r.json()
         status     = run.get("status")
         conclusion = run.get("conclusion")
         elapsed    = round(time.time() - start)
@@ -157,7 +167,7 @@ def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> dict:
 
         progress.progress(
             pct,
-            text=f"GitHub Actions: {status} ({elapsed}s elapsed) — "
+            text=f"GitHub Actions: {status} ({elapsed}s) — "
                  f"[View run]({run.get('html_url', '')})"
         )
 
@@ -180,12 +190,11 @@ def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> dict:
 def download_artifact(run_id: str, artifact_name: str) -> dict:
     """
     Download a named artifact from a completed GitHub Actions run.
-    Artifacts are ZIP files — we extract the JSON inside and parse it.
+    Artifacts are ZIP files — extracts the JSON inside and parses it.
     """
     repo    = _repo()
     headers = _gh_headers()
 
-    # List artifacts for this run
     r = requests.get(
         f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
         headers=headers,
@@ -194,10 +203,7 @@ def download_artifact(run_id: str, artifact_name: str) -> dict:
     r.raise_for_status()
     artifacts = r.json().get("artifacts", [])
 
-    target = next(
-        (a for a in artifacts if a["name"] == artifact_name),
-        None
-    )
+    target = next((a for a in artifacts if a["name"] == artifact_name), None)
     if not target:
         available = [a["name"] for a in artifacts]
         raise RuntimeError(
@@ -205,7 +211,6 @@ def download_artifact(run_id: str, artifact_name: str) -> dict:
             f"Available: {available}"
         )
 
-    # Download ZIP
     dl = requests.get(
         target["archive_download_url"],
         headers=headers,
@@ -213,7 +218,6 @@ def download_artifact(run_id: str, artifact_name: str) -> dict:
     )
     dl.raise_for_status()
 
-    # Extract JSON from ZIP
     with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
         json_files = [n for n in zf.namelist() if n.endswith(".json")]
         if not json_files:
@@ -242,10 +246,13 @@ def create_change() -> dict:
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json={
-            "short_description": "AI-Governed Linux Change (Ansible + GitHub Actions)",
-            "description":       "Automated pre/post Ansible health validation via OPENAI AI.",
-            "type":              "normal",
-            "state":             "-5",
+            "short_description":  "AI-Governed Linux Change (Ansible + GitHub Actions)",
+            "description":        "Automated pre/post Ansible health validation via Claude AI.",
+            "type":               "normal",
+            "state":              "-1",
+            "assigned_to":        "admin",
+            "planned_start_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "planned_end_date":   datetime.utcnow().strftime("%Y-%m-%d ") + "23:59:59",
         },
         timeout=15,
     )
@@ -254,7 +261,7 @@ def create_change() -> dict:
     return {"number": result["number"], "sys_id": result["sys_id"]}
 
 
-def update_change(sys_id: str, notes: str, state: str | None = None) -> None:
+def update_change(sys_id: str, notes: str, state=None) -> None:
     instance, user, password = _sn()
     payload = {"work_notes": notes}
     if state:
@@ -284,29 +291,24 @@ def attach_file(sys_id: str, filename: str, data: dict) -> None:
 # HIGH-LEVEL STEP FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_pre_health_check(change_number: str) -> tuple[dict, dict]:
-    """
-    Trigger pre_health_check workflow → wait → download artifact.
-    Returns (health_data, run_info).
-    """
-    run_id  = trigger_workflow("pre_health_check.yml", {"change_number": change_number})
-    run     = wait_for_workflow(run_id)
+# ══════════════════════════════════════════════════════════════════════════════
+# HIGH-LEVEL STEP FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_pre_health_check(change_number: str):
+    """Trigger pre_health_check → wait → download artifact. Returns (health, run_info)."""
+    run_id = trigger_workflow("pre_health_check.yml", {"change_number": change_number})
+    run    = wait_for_workflow(run_id)
 
     if run["conclusion"] == "failure":
-        raise RuntimeError(
-            f"pre_health_check workflow FAILED. "
-            f"View: {run.get('html_url')}"
-        )
+        raise RuntimeError(f"pre_health_check FAILED. View: {run.get('html_url')}")
 
     health = download_artifact(run_id, "pre_health")
     return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
 
 
-def run_apply_change(scenario_label: str, change_number: str) -> tuple[dict, dict]:
-    """
-    Trigger apply_change workflow → wait → download artifact.
-    Returns (change_info, run_info).
-    """
+def run_apply_change(scenario_label: str, change_number: str):
+    """Trigger apply_change → wait → download artifact. Returns (change_info, run_info)."""
     scenario_map = {
         "Small Disk (PASS)":      "small_disk",
         "Large Disk Fill (FAIL)": "large_disk",
@@ -322,28 +324,19 @@ def run_apply_change(scenario_label: str, change_number: str) -> tuple[dict, dic
     run = wait_for_workflow(run_id, timeout_seconds=420)
 
     if run["conclusion"] == "failure":
-        raise RuntimeError(
-            f"apply_change workflow FAILED. "
-            f"View: {run.get('html_url')}"
-        )
+        raise RuntimeError(f"apply_change FAILED. View: {run.get('html_url')}")
 
     change_info = download_artifact(run_id, "change_applied")
     return change_info, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
 
 
-def run_post_health_check(change_number: str) -> tuple[dict, dict]:
-    """
-    Trigger post_health_check workflow → wait → download artifact.
-    Returns (health_data, run_info).
-    """
+def run_post_health_check(change_number: str):
+    """Trigger post_health_check → wait → download artifact. Returns (health, run_info)."""
     run_id = trigger_workflow("post_health_check.yml", {"change_number": change_number})
     run    = wait_for_workflow(run_id)
 
     if run["conclusion"] == "failure":
-        raise RuntimeError(
-            f"post_health_check workflow FAILED. "
-            f"View: {run.get('html_url')}"
-        )
+        raise RuntimeError(f"post_health_check FAILED. View: {run.get('html_url')}")
 
     health = download_artifact(run_id, "post_health")
     return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
@@ -370,11 +363,11 @@ def run_cleanup(scenario_label: str) -> dict:
 def compare(pre: dict, post: dict) -> dict:
 
     def si(val, d=0):
-        try: return int(val)
+        try:    return int(val)
         except: return d
 
     def sf(val, d=0.0):
-        try: return float(val)
+        try:    return float(val)
         except: return d
 
     pre_root  = si(pre.get("disk",  {}).get("root", {}).get("used_percent", 0))
@@ -439,7 +432,7 @@ def risk_score(diff: dict) -> dict:
         score += 30 * len(failed)
         reasons.append(f"Service failures: {', '.join(failed)}")
 
-    score = min(score, 100)
+    score    = min(score, 100)
     severity = (
         "Low"      if score < 20 else
         "Medium"   if score < 50 else
@@ -447,7 +440,6 @@ def risk_score(diff: dict) -> dict:
         "Critical"
     )
     return {"score": score, "severity": severity, "reasons": reasons}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AI VALIDATION
