@@ -8,11 +8,11 @@ Flow per step:
      → polls GET /runs until completed / failed
   3. Streamlit calls download_artifact(run_id, name)
      → downloads ZIP artifact → extracts JSON
-  4. Claude AI validates pre+post JSON
+  4. OPENAI AI validates pre+post JSON
   5. ServiceNow updated with verdict + AI work notes
 
 Streamlit Secrets required:
-  ANTHROPIC_API_KEY
+  OPENAI_API_KEY
   GITHUB_PAT          Personal Access Token (repo + actions:write + actions:read)
   GITHUB_OWNER        your GitHub username or org
   GITHUB_REPO         repository name
@@ -32,7 +32,7 @@ import os
 import time
 import zipfile
 import requests
-import anthropic
+from openai import OpenAI
 import streamlit as st
 from datetime import datetime
 
@@ -240,7 +240,7 @@ def create_change() -> dict:
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json={
             "short_description": "AI-Governed Linux Change (Ansible + GitHub Actions)",
-            "description":       "Automated pre/post Ansible health validation via Claude AI.",
+            "description":       "Automated pre/post Ansible health validation via OPENAI AI.",
             "type":              "normal",
             "state":             "-5",
         },
@@ -452,14 +452,14 @@ def risk_score(diff: dict) -> dict:
 
 def ai_validate(pre: dict, post: dict, diff: dict, risk: dict, change: dict) -> dict:
     """
-    Send Ansible health JSON + diff + risk to Claude.
-    Claude produces PASS/FAIL verdict + ServiceNow work notes.
+    Send Ansible health JSON + diff + risk to OPENAI.
+    OPENAI produces PASS/FAIL verdict + ServiceNow work notes.
     """
-    api_key = _secret("ANTHROPIC_API_KEY")
+    api_key = _secret("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY missing.")
+        raise RuntimeError("OPENAI_API_KEY missing.")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     # Strip internal keys before sending to AI
     pre_clean  = {k: v for k, v in pre.items()  if not k.startswith("_")}
@@ -521,14 +521,16 @@ End with exactly one of:
 
 If FAIL — list exact remediation steps."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=1500,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    text    = response.content[0].text
+    text    = response.choices[0].message.content or ""
     verdict = "PASS" if "VALIDATION: PASS" in text.upper() else "FAIL"
 
     sn_notes = text
@@ -543,5 +545,5 @@ If FAIL — list exact remediation steps."""
         "full_analysis": text,
         "sn_notes":      sn_notes,
         "model":         response.model,
-        "tokens":        response.usage.input_tokens + response.usage.output_tokens,
+        "tokens":        (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0),
     }

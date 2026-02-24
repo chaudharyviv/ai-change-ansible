@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 st.title("🧠 AI Change Governance Platform")
-st.caption("Ansible · GitHub Actions · Claude AI · ServiceNow · Oracle Cloud")
+st.caption("Ansible · GitHub Actions · OPENAI · ServiceNow · Oracle Cloud")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -201,7 +201,7 @@ else:
 # ── Step 4: Post-Check + AI Validation ───────────────────────────────────────
 
 st.header("4️⃣ Post-Check + AI Validation")
-st.caption("Triggers `post_health_check.yml` → computes diff → Claude AI → ServiceNow")
+st.caption("Triggers `post_health_check.yml` → computes diff → OPENAI AI → ServiceNow")
 
 if not st.session_state.change_applied:
     st.warning("⬆️ Complete Step 3 first.")
@@ -229,7 +229,7 @@ else:
             st.session_state.risk = risk
 
         # AI Validation
-        with st.spinner("Sending to Claude AI..."):
+        with st.spinner("Sending to OPENAI AI..."):
             try:
                 final = ai_validate(
                     st.session_state.pre, post, diff, risk,
@@ -300,7 +300,7 @@ if st.session_state.final:
     with st.expander("📝 ServiceNow Work Notes (AI-written)", expanded=True):
         st.info(st.session_state.final["sn_notes"])
 
-    with st.expander("🤖 Full Claude AI Analysis"):
+    with st.expander("🤖 Full OPENAI AI Analysis"):
         st.markdown(st.session_state.final["full_analysis"])
         st.caption(f"Model: `{st.session_state.final.get('model','')}` | Tokens: `{st.session_state.final.get('tokens','')}`")
 

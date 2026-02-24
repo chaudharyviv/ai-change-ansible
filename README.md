@@ -27,7 +27,7 @@ GitHub Actions uploads JSON as artifact
 Streamlit downloads artifact via GitHub API
         │
         ▼
-Claude AI validates → ServiceNow updated
+OPENAI AI validates → ServiceNow updated
 ```
 
 ---
@@ -98,10 +98,10 @@ Go to: **repo → Actions → pre_health_check → Run workflow**
 App Settings → Secrets → paste:
 
 ```toml
-ANTHROPIC_API_KEY = "sk-ant-..."
-GITHUB_PAT        = "github_pat_..."
-GITHUB_OWNER      = "your-username"
-GITHUB_REPO       = "your-repo-name"
+OPENAI_API_KEY      = "sk-..."
+GITHUB_PAT          = "github_pat_..."
+GITHUB_OWNER        = "your-username"
+GITHUB_REPO         = "your-repo-name"
 SERVICENOW_INSTANCE = "dev12345.service-now.com"
 SERVICENOW_USER     = "admin"
 SERVICENOW_PASS     = "password"
