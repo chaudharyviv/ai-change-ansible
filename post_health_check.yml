@@ -1,12 +1,10 @@
 ---
-# =================================================================
+# =============================================================
 # post_health_check.yml
-# Runs on: Managed Node (Oracle VM #2)
-# Triggered by: Control Node via ansible-playbook
-# Output: /tmp/post_health.json  (read back by engine.py over SSH)
-#
-# Captures full system health AFTER the change window closes.
-# =================================================================
+# Runs ON: Oracle VM (managed node)
+# Triggered BY: GitHub Actions runner
+# Output: /tmp/post_health.json → SCP'd back → GHA artifact
+# =============================================================
 
 - name: Post-Change Health Check
   hosts: managed
@@ -14,10 +12,10 @@
 
   vars:
     output_file: /tmp/post_health.json
+    change_number: "UNKNOWN"
 
   tasks:
 
-    # ── Disk ──────────────────────────────────────────────────────
     - name: Get root filesystem usage
       command: df -h /
       register: df_root
@@ -43,7 +41,6 @@
       register: tmp_pct
       changed_when: false
 
-    # ── Memory ────────────────────────────────────────────────────
     - name: Get memory info
       command: free -m
       register: mem_raw
@@ -54,7 +51,6 @@
       register: mem_pct
       changed_when: false
 
-    # ── CPU / Load ────────────────────────────────────────────────
     - name: Get load average
       command: cat /proc/loadavg
       register: load_avg
@@ -70,7 +66,6 @@
       register: cpu_count
       changed_when: false
 
-    # ── Services ──────────────────────────────────────────────────
     - name: Check critical service states
       shell: systemctl is-active {{ item }} 2>/dev/null || echo "inactive"
       register: svc_results
@@ -81,19 +76,16 @@
         - firewalld
         - auditd
 
-    # ── Processes ─────────────────────────────────────────────────
     - name: Get top CPU processes
       shell: ps aux --sort=-%cpu | head -8
       register: top_procs
       changed_when: false
 
-    # ── Network ───────────────────────────────────────────────────
     - name: Get open ports
       shell: ss -tuln | head -20
       register: open_ports
       changed_when: false
 
-    # ── Write JSON output ─────────────────────────────────────────
     - name: Write post_health.json
       copy:
         dest: "{{ output_file }}"
@@ -101,6 +93,7 @@
       vars:
         result:
           phase: "POST"
+          change_number: "{{ change_number }}"
           timestamp: "{{ ansible_date_time.iso8601 }}"
           hostname: "{{ ansible_hostname }}"
           kernel: "{{ ansible_kernel }}"
@@ -126,10 +119,10 @@
     - name: Print summary
       debug:
         msg:
-          - "=== POST-CHANGE HEALTH CHECK COMPLETE ==="
+          - "=== POST-CHANGE HEALTH CHECK ==="
+          - "Change   : {{ change_number }}"
           - "Host     : {{ ansible_hostname }}"
-          - "Root Disk: {{ root_pct.stdout }}%"
+          - "Root     : {{ root_pct.stdout }}%"
           - "/tmp     : {{ tmp_pct.stdout }}%"
           - "Memory   : {{ mem_pct.stdout }}%"
           - "Load(1m) : {{ load_1m.stdout }}"
-          - "Output   : {{ output_file }}"

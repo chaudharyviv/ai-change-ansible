@@ -1,12 +1,10 @@
 ---
-# =================================================================
+# =============================================================
 # pre_health_check.yml
-# Runs on: Managed Node (Oracle VM #2)
-# Triggered by: Control Node via ansible-playbook
-# Output: /tmp/pre_health.json  (read back by engine.py over SSH)
-#
-# Captures full system health BEFORE the change window opens.
-# =================================================================
+# Runs ON: Oracle VM (managed node)
+# Triggered BY: GitHub Actions runner (control node)
+# Output: /tmp/pre_health.json  → SCP'd back → GHA artifact
+# =============================================================
 
 - name: Pre-Change Health Check
   hosts: managed
@@ -14,10 +12,10 @@
 
   vars:
     output_file: /tmp/pre_health.json
+    change_number: "UNKNOWN"
 
   tasks:
 
-    # ── Disk ──────────────────────────────────────────────────────
     - name: Get root filesystem usage
       command: df -h /
       register: df_root
@@ -43,7 +41,6 @@
       register: tmp_pct
       changed_when: false
 
-    # ── Memory ────────────────────────────────────────────────────
     - name: Get memory info
       command: free -m
       register: mem_raw
@@ -54,7 +51,6 @@
       register: mem_pct
       changed_when: false
 
-    # ── CPU / Load ────────────────────────────────────────────────
     - name: Get load average
       command: cat /proc/loadavg
       register: load_avg
@@ -70,7 +66,6 @@
       register: cpu_count
       changed_when: false
 
-    # ── Services ──────────────────────────────────────────────────
     - name: Check critical service states
       shell: systemctl is-active {{ item }} 2>/dev/null || echo "inactive"
       register: svc_results
@@ -81,45 +76,26 @@
         - firewalld
         - auditd
 
-    # ── Processes ─────────────────────────────────────────────────
     - name: Get top CPU processes
       shell: ps aux --sort=-%cpu | head -8
       register: top_procs
       changed_when: false
 
-    # ── Network ───────────────────────────────────────────────────
     - name: Get open ports
       shell: ss -tuln | head -20
       register: open_ports
       changed_when: false
 
-    # ── Build warnings list ───────────────────────────────────────
-    - name: Flag high root disk
+    - name: Build warnings list
       set_fact:
-        warnings: "{{ (warnings | default([])) + ['Root disk at ' + root_pct.stdout + '%'] }}"
-      when: root_pct.stdout | int > 80
+        warnings: >-
+          {{
+            ([] if root_pct.stdout | int <= 80 else ['Root disk at ' + root_pct.stdout + '%']) +
+            ([] if tmp_pct.stdout  | int <= 75 else ['/tmp disk at ' + tmp_pct.stdout + '%']) +
+            ([] if load_1m.stdout  | float <= 3.0 else ['Load avg ' + load_1m.stdout + ' elevated']) +
+            ([] if mem_pct.stdout  | int <= 85 else ['Memory at ' + mem_pct.stdout + '%'])
+          }}
 
-    - name: Flag high /tmp disk
-      set_fact:
-        warnings: "{{ (warnings | default([])) + ['/tmp disk at ' + tmp_pct.stdout + '%'] }}"
-      when: tmp_pct.stdout | int > 75
-
-    - name: Flag high load
-      set_fact:
-        warnings: "{{ (warnings | default([])) + ['Load avg ' + load_1m.stdout + ' is elevated'] }}"
-      when: load_1m.stdout | float > 3.0
-
-    - name: Flag high memory
-      set_fact:
-        warnings: "{{ (warnings | default([])) + ['Memory usage at ' + mem_pct.stdout + '%'] }}"
-      when: mem_pct.stdout | int > 85
-
-    - name: Set empty warnings if none triggered
-      set_fact:
-        warnings: []
-      when: warnings is not defined
-
-    # ── Write JSON output ─────────────────────────────────────────
     - name: Write pre_health.json
       copy:
         dest: "{{ output_file }}"
@@ -127,6 +103,7 @@
       vars:
         result:
           phase: "PRE"
+          change_number: "{{ change_number }}"
           timestamp: "{{ ansible_date_time.iso8601 }}"
           hostname: "{{ ansible_hostname }}"
           kernel: "{{ ansible_kernel }}"
@@ -153,11 +130,11 @@
     - name: Print summary
       debug:
         msg:
-          - "=== PRE-CHANGE HEALTH CHECK COMPLETE ==="
+          - "=== PRE-CHANGE HEALTH CHECK ==="
+          - "Change   : {{ change_number }}"
           - "Host     : {{ ansible_hostname }}"
-          - "Root Disk: {{ root_pct.stdout }}%"
+          - "Root     : {{ root_pct.stdout }}%"
           - "/tmp     : {{ tmp_pct.stdout }}%"
           - "Memory   : {{ mem_pct.stdout }}%"
           - "Load(1m) : {{ load_1m.stdout }}"
           - "Warnings : {{ warnings | length }}"
-          - "Output   : {{ output_file }}"

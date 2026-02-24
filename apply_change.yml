@@ -1,17 +1,11 @@
 ---
-# =================================================================
+# =============================================================
 # apply_change.yml
-# Runs on: Managed Node (Oracle VM #2)
-# Triggered by: Control Node via ansible-playbook
-#
-# Usage:
-#   ansible-playbook apply_change.yml -e "scenario=small_disk"
-#   ansible-playbook apply_change.yml -e "scenario=large_disk"
-#   ansible-playbook apply_change.yml -e "scenario=cpu_stress"
-#   ansible-playbook apply_change.yml -e "scenario=stop_service"
-#
+# Runs ON: Oracle VM (managed node)
+# Triggered BY: GitHub Actions runner
+# Extra vars: scenario, change_number
 # Output: /tmp/change_applied.json
-# =================================================================
+# =============================================================
 
 - name: Apply Change Scenario
   hosts: managed
@@ -19,6 +13,7 @@
 
   vars:
     scenario: "small_disk"
+    change_number: "UNKNOWN"
     temp_small: /tmp/ai_small.bin
     temp_large: /tmp/ai_large.bin
     output_file: /tmp/change_applied.json
@@ -27,46 +22,44 @@
 
     - name: Validate scenario
       fail:
-        msg: >
-          Unknown scenario '{{ scenario }}'.
-          Valid options: small_disk | large_disk | cpu_stress | stop_service
+        msg: "Invalid scenario '{{ scenario }}'. Use: small_disk | large_disk | cpu_stress | stop_service"
       when: scenario not in ['small_disk', 'large_disk', 'cpu_stress', 'stop_service']
 
-    # ── small_disk: write 50MB → PASS expected ────────────────────
-    - name: "[small_disk] Write 50MB temp file to /tmp"
+    # ── small_disk: 50MB write → PASS ──────────────────────────
+    - name: "[small_disk] Write 50MB to /tmp"
       command: dd if=/dev/zero of={{ temp_small }} bs=1M count=50 status=none
       when: scenario == "small_disk"
       changed_when: true
 
-    # ── large_disk: write 2GB → FAIL expected ────────────────────
-    - name: "[large_disk] Write 2GB temp file to /tmp"
+    # ── large_disk: 2GB write → FAIL ───────────────────────────
+    - name: "[large_disk] Write 2GB to /tmp"
       command: dd if=/dev/zero of={{ temp_large }} bs=1M count=2000 status=none
       when: scenario == "large_disk"
       changed_when: true
       async: 300
       poll: 10
 
-    # ── cpu_stress: 4 yes processes → FAIL expected ───────────────
-    - name: "[cpu_stress] Spawn 4 CPU stress processes"
+    # ── cpu_stress: 4 yes processes → FAIL ─────────────────────
+    - name: "[cpu_stress] Spawn stress processes"
       shell: nohup yes > /dev/null 2>&1 & echo $!
       when: scenario == "cpu_stress"
       loop: [1, 2, 3, 4]
-      register: cpu_pids_result
+      register: cpu_pids
       changed_when: true
 
-    - name: "[cpu_stress] Save remote PIDs for cleanup"
+    - name: "[cpu_stress] Save PIDs"
       copy:
         dest: /tmp/stress_pids.txt
-        content: "{{ cpu_pids_result.results | map(attribute='stdout') | join('\n') }}\n"
+        content: "{{ cpu_pids.results | map(attribute='stdout') | join('\n') }}\n"
       when: scenario == "cpu_stress"
 
-    - name: "[cpu_stress] Wait 5s for load to build"
+    - name: "[cpu_stress] Wait for load to build"
       pause:
         seconds: 5
       when: scenario == "cpu_stress"
 
-    # ── stop_service: stop chronyd → FAIL expected ───────────────
-    - name: "[stop_service] Stop chronyd service"
+    # ── stop_service: stop chronyd → FAIL ──────────────────────
+    - name: "[stop_service] Stop chronyd"
       systemd:
         name: chronyd
         state: stopped
@@ -74,23 +67,22 @@
       when: scenario == "stop_service"
       changed_when: true
 
-    # ── Capture immediate post-change state ───────────────────────
-    - name: Get disk percent after change
+    # ── Capture immediate state ─────────────────────────────────
+    - name: Root disk percent post-change
       shell: df / | tail -1 | awk '{print $5}' | tr -d '%'
       register: post_root_pct
       changed_when: false
 
-    - name: Get /tmp percent after change
+    - name: /tmp percent post-change
       shell: df /tmp | tail -1 | awk '{print $5}' | tr -d '%'
       register: post_tmp_pct
       changed_when: false
 
-    - name: Get load after change
+    - name: Load post-change
       shell: cat /proc/loadavg | awk '{print $1}'
       register: post_load
       changed_when: false
 
-    # ── Write output JSON ─────────────────────────────────────────
     - name: Write change_applied.json
       copy:
         dest: "{{ output_file }}"
@@ -98,24 +90,20 @@
       vars:
         result:
           scenario: "{{ scenario }}"
+          change_number: "{{ change_number }}"
           timestamp: "{{ ansible_date_time.iso8601 }}"
           hostname: "{{ ansible_hostname }}"
           expected_verdict: "{{ 'PASS' if scenario == 'small_disk' else 'FAIL' }}"
           immediate_root_pct: "{{ post_root_pct.stdout | int }}"
           immediate_tmp_pct: "{{ post_tmp_pct.stdout | int }}"
           immediate_load_1m: "{{ post_load.stdout | float }}"
-          description:
-            small_disk: "Wrote 50MB to /tmp — expected PASS"
-            large_disk: "Wrote 2GB to /tmp — expected FAIL"
-            cpu_stress: "Spawned 4 CPU stress processes — expected FAIL"
-            stop_service: "Stopped chronyd service — expected FAIL"
 
-    - name: Print change summary
+    - name: Print summary
       debug:
         msg:
           - "=== CHANGE APPLIED ==="
           - "Scenario  : {{ scenario }}"
           - "Expected  : {{ 'PASS' if scenario == 'small_disk' else 'FAIL' }}"
           - "Root Disk : {{ post_root_pct.stdout }}%"
-          - "/tmp Disk : {{ post_tmp_pct.stdout }}%"
+          - "/tmp      : {{ post_tmp_pct.stdout }}%"
           - "Load(1m)  : {{ post_load.stdout }}"

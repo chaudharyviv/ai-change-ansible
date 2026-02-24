@@ -1,31 +1,38 @@
 """
-engine.py — AI Change Governance Platform (Ansible Edition)
-============================================================
-Architecture:
-  Streamlit Cloud ──SSH──▶ Control Node (Oracle VM #1)
-                               └─ ansible-playbook ──▶ Managed Node (Oracle VM #2)
-                                                            └─ health JSON written
-                               └─ engine.py reads JSON back over SSH
-                               └─ OPENAI AI validates
-                               └─ ServiceNow updated
+engine.py — AI Change Governance Platform (GitHub Actions Edition)
+==================================================================
+Flow per step:
+  1. Streamlit calls trigger_workflow(workflow, inputs)
+     → POST to GitHub API → dispatches Actions run
+  2. Streamlit calls wait_for_workflow(run_id)
+     → polls GET /runs until completed / failed
+  3. Streamlit calls download_artifact(run_id, name)
+     → downloads ZIP artifact → extracts JSON
+  4. Claude AI validates pre+post JSON
+  5. ServiceNow updated with verdict + AI work notes
 
 Streamlit Secrets required:
-  OPENAI_API_KEY
-  SERVICENOW_INSTANCE       e.g. dev12345.service-now.com
+  ANTHROPIC_API_KEY
+  GITHUB_PAT          Personal Access Token (repo + actions:write + actions:read)
+  GITHUB_OWNER        your GitHub username or org
+  GITHUB_REPO         repository name
+  SERVICENOW_INSTANCE e.g. dev12345.service-now.com
   SERVICENOW_USER
   SERVICENOW_PASS
-  CONTROL_SSH_HOST          Control Node public IP  (Oracle VM #1)
-  CONTROL_SSH_USER          e.g. opc
-  CONTROL_SSH_PRIVATE_KEY   Full PEM contents (multiline)
+
+GitHub Repository Secrets (set in repo Settings → Secrets → Actions):
+  ORACLE_VM_HOST           Oracle VM public IP
+  ORACLE_VM_USER           e.g. opc
+  ORACLE_SSH_PRIVATE_KEY   Full PEM contents
 """
 
 import io
 import json
 import os
 import time
+import zipfile
 import requests
-from openai import OpenAI
-import paramiko
+import anthropic
 import streamlit as st
 from datetime import datetime
 
@@ -39,101 +46,181 @@ def _secret(key: str) -> str:
         return os.getenv(key, "")
 
 
-# ── Paths on the Control Node ─────────────────────────────────────────────────
+# ── GitHub API base ───────────────────────────────────────────────────────────
 
-PLAYBOOK_DIR  = "~/ansible_project/playbooks"
-INVENTORY     = f"{PLAYBOOK_DIR}/inventory.ini"
-PRE_JSON      = "/tmp/pre_health.json"
-POST_JSON     = "/tmp/post_health.json"
-CHANGE_JSON   = "/tmp/change_applied.json"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SSH — connect to Control Node
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _ssh() -> paramiko.SSHClient:
-    """Return authenticated SSH client connected to the Control Node."""
-    host    = _secret("CONTROL_SSH_HOST")
-    user    = _secret("CONTROL_SSH_USER")
-    pem_str = _secret("CONTROL_SSH_PRIVATE_KEY")
-
-    if not all([host, user, pem_str]):
-        raise RuntimeError(
-            "SSH secrets missing. Add CONTROL_SSH_HOST, CONTROL_SSH_USER, "
-            "CONTROL_SSH_PRIVATE_KEY to Streamlit secrets."
-        )
-
-    pkey   = paramiko.RSAKey.from_private_key(io.StringIO(pem_str))
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, username=user, pkey=pkey, timeout=15)
-    return client
-
-
-def _run(cmd: str, timeout: int = 300) -> tuple[str, str, int]:
-    """
-    Run a command on the Control Node.
-    Returns (stdout, stderr, exit_code).
-    """
-    client = _ssh()
-    _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    out  = stdout.read().decode().strip()
-    err  = stderr.read().decode().strip()
-    code = stdout.channel.recv_exit_status()
-    client.close()
-    return out, err, code
-
-
-def _read_remote_json(remote_path: str) -> dict:
-    """
-    SCP a JSON file from the Control Node back to Streamlit and parse it.
-    The JSON was written there by the Ansible playbook on the Managed Node
-    and pulled back by the Control Node post-run.
-    """
-    client = _ssh()
-    sftp   = client.open_sftp()
-    buf    = io.BytesIO()
-    sftp.getfo(remote_path, buf)
-    sftp.close()
-    client.close()
-    buf.seek(0)
-    return json.loads(buf.read().decode())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ANSIBLE runner
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _ansible(playbook: str, extra_vars: dict | None = None, timeout: int = 300) -> dict:
-    """
-    Run an ansible-playbook command on the Control Node.
-    Returns structured result with stdout, stderr, rc, and parsed JSON output.
-    """
-    ev_str = ""
-    if extra_vars:
-        kv     = " ".join(f"{k}={v}" for k, v in extra_vars.items())
-        ev_str = f"-e \"{kv}\""
-
-    cmd = (
-        f"ansible-playbook {PLAYBOOK_DIR}/{playbook} "
-        f"-i {INVENTORY} {ev_str} 2>&1"
-    )
-
-    out, err, rc = _run(cmd, timeout=timeout)
-
+def _gh_headers() -> dict:
+    token = _secret("GITHUB_PAT")
+    if not token:
+        raise RuntimeError("GITHUB_PAT missing from Streamlit secrets.")
     return {
-        "playbook": playbook,
-        "rc":       rc,
-        "stdout":   out,
-        "stderr":   err,
-        "success":  rc == 0,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "Authorization":        f"Bearer {token}",
+        "Accept":               "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
+def _repo() -> str:
+    owner = _secret("GITHUB_OWNER")
+    repo  = _secret("GITHUB_REPO")
+    if not owner or not repo:
+        raise RuntimeError("GITHUB_OWNER and GITHUB_REPO must be set in Streamlit secrets.")
+    return f"{owner}/{repo}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — ServiceNow: create_change()
+# GITHUB ACTIONS — trigger, poll, download
+# ══════════════════════════════════════════════════════════════════════════════
+
+def trigger_workflow(workflow_filename: str, inputs: dict) -> str:
+    """
+    Dispatch a workflow_dispatch event to GitHub Actions.
+    Returns the run_id of the triggered run (fetched immediately after dispatch).
+    """
+    repo    = _repo()
+    headers = _gh_headers()
+
+    # Record time just before dispatch so we can find this specific run
+    before_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    r = requests.post(
+        f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_filename}/dispatches",
+        headers=headers,
+        json={"ref": "main", "inputs": inputs},
+        timeout=15,
+    )
+    if r.status_code != 204:
+        raise RuntimeError(
+            f"GitHub dispatch failed ({r.status_code}): {r.text}"
+        )
+
+    # Give GitHub 3s to register the run, then find its run_id
+    time.sleep(3)
+    run_id = _find_run_id(workflow_filename, before_ts)
+    return run_id
+
+
+def _find_run_id(workflow_filename: str, created_after: str) -> str:
+    """
+    Find the run_id of the most recently triggered run for a workflow.
+    Retries for up to 30 seconds in case GitHub is slow to register it.
+    """
+    repo    = _repo()
+    headers = _gh_headers()
+
+    for _ in range(10):
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_filename}/runs",
+            headers=headers,
+            params={"per_page": 5, "created": f">={created_after}"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        runs = r.json().get("workflow_runs", [])
+        if runs:
+            return str(runs[0]["id"])
+        time.sleep(3)
+
+    raise RuntimeError(
+        f"Could not find a new run for {workflow_filename} after dispatch. "
+        "Check GitHub Actions tab in your repo."
+    )
+
+
+def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> dict:
+    """
+    Poll GitHub Actions until the run completes or timeout is reached.
+    Returns the full run object with status and conclusion.
+    Shows a Streamlit progress bar while waiting.
+    """
+    repo    = _repo()
+    headers = _gh_headers()
+    start   = time.time()
+
+    progress = st.progress(0, text="GitHub Actions running...")
+    elapsed  = 0
+
+    while elapsed < timeout_seconds:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/actions/runs/{run_id}",
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        run = r.json()
+
+        status     = run.get("status")
+        conclusion = run.get("conclusion")
+        elapsed    = round(time.time() - start)
+        pct        = min(int(elapsed / timeout_seconds * 100), 95)
+
+        progress.progress(
+            pct,
+            text=f"GitHub Actions: {status} ({elapsed}s elapsed) — "
+                 f"[View run]({run.get('html_url', '')})"
+        )
+
+        if status == "completed":
+            progress.progress(100, text=f"Completed: {conclusion}")
+            if conclusion not in ("success", "failure"):
+                raise RuntimeError(
+                    f"Workflow run {run_id} ended with unexpected conclusion: {conclusion}"
+                )
+            run["elapsed_seconds"] = elapsed
+            return run
+
+        time.sleep(8)
+
+    raise RuntimeError(
+        f"Workflow run {run_id} did not complete within {timeout_seconds}s."
+    )
+
+
+def download_artifact(run_id: str, artifact_name: str) -> dict:
+    """
+    Download a named artifact from a completed GitHub Actions run.
+    Artifacts are ZIP files — we extract the JSON inside and parse it.
+    """
+    repo    = _repo()
+    headers = _gh_headers()
+
+    # List artifacts for this run
+    r = requests.get(
+        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
+        headers=headers,
+        timeout=15,
+    )
+    r.raise_for_status()
+    artifacts = r.json().get("artifacts", [])
+
+    target = next(
+        (a for a in artifacts if a["name"] == artifact_name),
+        None
+    )
+    if not target:
+        available = [a["name"] for a in artifacts]
+        raise RuntimeError(
+            f"Artifact '{artifact_name}' not found in run {run_id}. "
+            f"Available: {available}"
+        )
+
+    # Download ZIP
+    dl = requests.get(
+        target["archive_download_url"],
+        headers=headers,
+        timeout=30,
+    )
+    dl.raise_for_status()
+
+    # Extract JSON from ZIP
+    with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+        json_files = [n for n in zf.namelist() if n.endswith(".json")]
+        if not json_files:
+            raise RuntimeError(f"No JSON file found inside artifact '{artifact_name}'.")
+        with zf.open(json_files[0]) as jf:
+            return json.loads(jf.read().decode())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVICENOW
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sn():
@@ -152,8 +239,8 @@ def create_change() -> dict:
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json={
-            "short_description": "AI-Governed Linux Change (Ansible)",
-            "description":       "Automated Ansible pre/post health validation via OPENAI AI.",
+            "short_description": "AI-Governed Linux Change (Ansible + GitHub Actions)",
+            "description":       "Automated pre/post Ansible health validation via Claude AI.",
             "type":              "normal",
             "state":             "-5",
         },
@@ -169,59 +256,53 @@ def update_change(sys_id: str, notes: str, state: str | None = None) -> None:
     payload = {"work_notes": notes}
     if state:
         payload["state"] = state
-    r = requests.patch(
+    requests.patch(
         f"https://{instance}/api/now/table/change_request/{sys_id}",
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json=payload,
         timeout=15,
-    )
-    r.raise_for_status()
+    ).raise_for_status()
 
 
 def attach_file(sys_id: str, filename: str, data: dict) -> None:
     instance, user, password = _sn()
-    r = requests.post(
+    requests.post(
         f"https://{instance}/api/now/attachment/file"
         f"?table_name=change_request&table_sys_id={sys_id}&file_name={filename}",
         auth=(user, password),
         headers={"Content-Type": "application/octet-stream", "Accept": "application/json"},
         data=json.dumps(data, indent=2).encode(),
         timeout=15,
-    )
-    r.raise_for_status()
+    ).raise_for_status()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — pre_health_check()
+# HIGH-LEVEL STEP FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def pre_health_check() -> dict:
+def run_pre_health_check(change_number: str) -> tuple[dict, dict]:
     """
-    Trigger pre_health_check.yml on the Managed Node via the Control Node.
-    Pull the resulting JSON back to Streamlit.
+    Trigger pre_health_check workflow → wait → download artifact.
+    Returns (health_data, run_info).
     """
-    result = _ansible("pre_health_check.yml")
-    if not result["success"]:
+    run_id  = trigger_workflow("pre_health_check.yml", {"change_number": change_number})
+    run     = wait_for_workflow(run_id)
+
+    if run["conclusion"] == "failure":
         raise RuntimeError(
-            f"pre_health_check.yml failed (rc={result['rc']}):\n{result['stdout']}"
+            f"pre_health_check workflow FAILED. "
+            f"View: {run.get('html_url')}"
         )
 
-    # Pull the JSON the playbook wrote on the Managed Node
-    # (Ansible fetched it to /tmp/pre_health.json on the control node via fetch module)
-    health = _read_remote_json(PRE_JSON)
-    health["_ansible_run"] = result
-    return health
+    health = download_artifact(run_id, "pre_health")
+    return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — apply_change()
-# ══════════════════════════════════════════════════════════════════════════════
-
-def apply_change(scenario: str) -> dict:
+def run_apply_change(scenario_label: str, change_number: str) -> tuple[dict, dict]:
     """
-    Trigger apply_change.yml on the Managed Node with the chosen scenario.
-    scenario must be one of: small_disk | large_disk | cpu_stress | stop_service
+    Trigger apply_change workflow → wait → download artifact.
+    Returns (change_info, run_info).
     """
     scenario_map = {
         "Small Disk (PASS)":      "small_disk",
@@ -229,69 +310,79 @@ def apply_change(scenario: str) -> dict:
         "CPU Stress (FAIL)":      "cpu_stress",
         "Stop a Service (FAIL)":  "stop_service",
     }
-    key = scenario_map.get(scenario, scenario)
+    scenario = scenario_map.get(scenario_label, scenario_label)
 
-    result = _ansible("apply_change.yml", extra_vars={"scenario": key}, timeout=360)
-    if not result["success"]:
+    run_id = trigger_workflow("apply_change.yml", {
+        "scenario":      scenario,
+        "change_number": change_number,
+    })
+    run = wait_for_workflow(run_id, timeout_seconds=420)
+
+    if run["conclusion"] == "failure":
         raise RuntimeError(
-            f"apply_change.yml failed (rc={result['rc']}):\n{result['stdout']}"
+            f"apply_change workflow FAILED. "
+            f"View: {run.get('html_url')}"
         )
 
-    change_info = _read_remote_json(CHANGE_JSON)
-    change_info["_ansible_run"] = result
-    return change_info
+    change_info = download_artifact(run_id, "change_applied")
+    return change_info, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — post_health_check()
-# ══════════════════════════════════════════════════════════════════════════════
-
-def post_health_check() -> dict:
+def run_post_health_check(change_number: str) -> tuple[dict, dict]:
     """
-    Trigger post_health_check.yml on the Managed Node via the Control Node.
-    Pull the resulting JSON back to Streamlit.
+    Trigger post_health_check workflow → wait → download artifact.
+    Returns (health_data, run_info).
     """
-    result = _ansible("post_health_check.yml")
-    if not result["success"]:
+    run_id = trigger_workflow("post_health_check.yml", {"change_number": change_number})
+    run    = wait_for_workflow(run_id)
+
+    if run["conclusion"] == "failure":
         raise RuntimeError(
-            f"post_health_check.yml failed (rc={result['rc']}):\n{result['stdout']}"
+            f"post_health_check workflow FAILED. "
+            f"View: {run.get('html_url')}"
         )
 
-    health = _read_remote_json(POST_JSON)
-    health["_ansible_run"] = result
-    return health
+    health = download_artifact(run_id, "post_health")
+    return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
+
+
+def run_cleanup(scenario_label: str) -> dict:
+    """Trigger cleanup workflow."""
+    scenario_map = {
+        "Small Disk (PASS)":      "small_disk",
+        "Large Disk Fill (FAIL)": "large_disk",
+        "CPU Stress (FAIL)":      "cpu_stress",
+        "Stop a Service (FAIL)":  "stop_service",
+    }
+    scenario = scenario_map.get(scenario_label, "small_disk")
+    run_id   = trigger_workflow("cleanup.yml", {"scenario": scenario})
+    run      = wait_for_workflow(run_id, timeout_seconds=120)
+    return {"run_id": run_id, "url": run.get("html_url"), "conclusion": run.get("conclusion")}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — compare(pre, post)
+# DIFF + RISK
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compare(pre: dict, post: dict) -> dict:
-    """Compute structured diff between pre and post Ansible health snapshots."""
 
-    def safe_int(val, default=0):
-        try:
-            return int(val)
-        except Exception:
-            return default
+    def si(val, d=0):
+        try: return int(val)
+        except: return d
 
-    def safe_float(val, default=0.0):
-        try:
-            return float(val)
-        except Exception:
-            return default
+    def sf(val, d=0.0):
+        try: return float(val)
+        except: return d
 
-    pre_root  = safe_int(pre.get("disk", {}).get("root", {}).get("used_percent", 0))
-    post_root = safe_int(post.get("disk", {}).get("root", {}).get("used_percent", 0))
-    pre_tmp   = safe_int(pre.get("disk", {}).get("tmp",  {}).get("used_percent", 0))
-    post_tmp  = safe_int(post.get("disk", {}).get("tmp",  {}).get("used_percent", 0))
+    pre_root  = si(pre.get("disk",  {}).get("root", {}).get("used_percent", 0))
+    post_root = si(post.get("disk", {}).get("root", {}).get("used_percent", 0))
+    pre_tmp   = si(pre.get("disk",  {}).get("tmp",  {}).get("used_percent", 0))
+    post_tmp  = si(post.get("disk", {}).get("tmp",  {}).get("used_percent", 0))
+    pre_load  = sf(pre.get("load_1m",  0))
+    post_load = sf(post.get("load_1m", 0))
+    pre_mem   = si(pre.get("memory",  {}).get("used_percent", 0))
+    post_mem  = si(post.get("memory", {}).get("used_percent", 0))
 
-    pre_load  = safe_float(pre.get("load_1m",  0))
-    post_load = safe_float(post.get("load_1m", 0))
-    pre_mem   = safe_int(pre.get("memory",  {}).get("used_percent", 0))
-    post_mem  = safe_int(post.get("memory", {}).get("used_percent", 0))
-
-    # Service changes
     pre_svcs  = pre.get("services",  {})
     post_svcs = post.get("services", {})
     svc_changes = {
@@ -301,196 +392,156 @@ def compare(pre: dict, post: dict) -> dict:
     }
 
     return {
-        "disk_root_before":    pre_root,
-        "disk_root_after":     post_root,
-        "disk_root_delta":     post_root - pre_root,
-        "disk_tmp_before":     pre_tmp,
-        "disk_tmp_after":      post_tmp,
-        "disk_tmp_delta":      post_tmp - pre_tmp,
-        "load_before":         pre_load,
-        "load_after":          post_load,
-        "load_delta":          round(post_load - pre_load, 2),
-        "memory_before":       pre_mem,
-        "memory_after":        post_mem,
-        "memory_delta":        post_mem - pre_mem,
-        "service_changes":     svc_changes,
-        "top_processes_post":  post.get("top_processes", ""),
-        "pre_warnings":        pre.get("warnings", []),
+        "disk_root_before":   pre_root,
+        "disk_root_after":    post_root,
+        "disk_root_delta":    post_root - pre_root,
+        "disk_tmp_before":    pre_tmp,
+        "disk_tmp_after":     post_tmp,
+        "disk_tmp_delta":     post_tmp - pre_tmp,
+        "load_before":        pre_load,
+        "load_after":         post_load,
+        "load_delta":         round(post_load - pre_load, 2),
+        "memory_before":      pre_mem,
+        "memory_after":       post_mem,
+        "memory_delta":       post_mem - pre_mem,
+        "service_changes":    svc_changes,
+        "top_processes_post": post.get("top_processes", ""),
+        "pre_warnings":       pre.get("warnings", []),
     }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — risk_score(diff)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def risk_score(diff: dict) -> dict:
     score, reasons = 0, []
 
-    if diff["disk_root_after"] > 90:
-        score += 50;  reasons.append(f"Root disk critical: {diff['disk_root_after']}%")
-    elif diff["disk_root_after"] > 80:
-        score += 25;  reasons.append(f"Root disk high: {diff['disk_root_after']}%")
+    if   diff["disk_root_after"] > 90: score += 50; reasons.append(f"Root disk critical: {diff['disk_root_after']}%")
+    elif diff["disk_root_after"] > 80: score += 25; reasons.append(f"Root disk high: {diff['disk_root_after']}%")
 
-    if diff["disk_tmp_after"] > 90:
-        score += 35;  reasons.append(f"/tmp critical: {diff['disk_tmp_after']}%")
-    elif diff["disk_tmp_after"] > 75:
-        score += 15;  reasons.append(f"/tmp elevated: {diff['disk_tmp_after']}%")
+    if   diff["disk_tmp_after"]  > 90: score += 35; reasons.append(f"/tmp critical: {diff['disk_tmp_after']}%")
+    elif diff["disk_tmp_after"]  > 75: score += 15; reasons.append(f"/tmp elevated: {diff['disk_tmp_after']}%")
 
-    if diff["load_after"] > 8:
-        score += 40;  reasons.append(f"Load very high: {diff['load_after']}")
-    elif diff["load_after"] > 3:
-        score += 20;  reasons.append(f"Load elevated: {diff['load_after']}")
+    if   diff["load_after"] > 8: score += 40; reasons.append(f"Load very high: {diff['load_after']}")
+    elif diff["load_after"] > 3: score += 20; reasons.append(f"Load elevated: {diff['load_after']}")
 
-    if diff["disk_root_delta"] > 20:
-        score += 20;  reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
-    elif diff["disk_root_delta"] > 10:
-        score += 10;  reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
+    if   diff["disk_root_delta"] > 20: score += 20; reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
+    elif diff["disk_root_delta"] > 10: score += 10; reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
 
-    if diff["disk_tmp_delta"] > 15:
-        score += 15;  reasons.append(f"/tmp grew +{diff['disk_tmp_delta']}%")
+    if diff["disk_tmp_delta"] > 15: score += 15; reasons.append(f"/tmp grew +{diff['disk_tmp_delta']}%")
 
-    failed_svcs = [
-        f"{s}: {v['before']} → {v['after']}"
+    failed = [
+        f"{s}: {v['before']}→{v['after']}"
         for s, v in diff["service_changes"].items()
         if v["after"] in ("inactive", "failed", "unknown")
     ]
-    if failed_svcs:
-        score += 30 * len(failed_svcs)
-        reasons.append(f"Service failures: {', '.join(failed_svcs)}")
+    if failed:
+        score += 30 * len(failed)
+        reasons.append(f"Service failures: {', '.join(failed)}")
 
     score = min(score, 100)
-
-    if score < 20:   severity = "Low"
-    elif score < 50: severity = "Medium"
-    elif score < 80: severity = "High"
-    else:            severity = "Critical"
-
+    severity = (
+        "Low"      if score < 20 else
+        "Medium"   if score < 50 else
+        "High"     if score < 80 else
+        "Critical"
+    )
     return {"score": score, "severity": severity, "reasons": reasons}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 7 — ai_validate()
+# AI VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ai_validate(pre: dict, post: dict, diff: dict, risk: dict, change_info: dict) -> dict:
+def ai_validate(pre: dict, post: dict, diff: dict, risk: dict, change: dict) -> dict:
     """
-    Send Ansible playbook outputs + diff + risk model to OPENAI.
-    OPENAI parses the structured JSON, validates the change, and returns
-    PASS or FAIL with a full SRE-style analysis for ServiceNow work notes.
+    Send Ansible health JSON + diff + risk to Claude.
+    Claude produces PASS/FAIL verdict + ServiceNow work notes.
     """
-    api_key = _secret("OPENAI_API_KEY")
+    api_key = _secret("ANTHROPIC_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY missing from Streamlit secrets.")
+        raise RuntimeError("ANTHROPIC_API_KEY missing.")
 
-    client = OpenAI(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key)
 
-    system = """You are a senior Site Reliability Engineer validating a Linux system change.
-You receive structured output from Ansible health-check playbooks and a risk model.
-You reason carefully from the data, write clear ServiceNow-ready work notes,
-and always end with a definitive PASS or FAIL verdict. You never hedge."""
+    # Strip internal keys before sending to AI
+    pre_clean  = {k: v for k, v in pre.items()  if not k.startswith("_")}
+    post_clean = {k: v for k, v in post.items() if not k.startswith("_")}
 
-    prompt = f"""A change has been applied to a managed Linux server.
-The health data below was collected by Ansible playbooks before and after the change.
+    system = """You are a senior Site Reliability Engineer validating a Linux change.
+Health data was collected by Ansible playbooks running via GitHub Actions.
+You reason carefully from structured JSON, write clear ServiceNow work notes,
+and always end with a definitive PASS or FAIL. You never hedge."""
 
-## Pre-Change Ansible Health Output
+    prompt = f"""A change has been applied to a managed Oracle Linux server.
+Below is the structured output from Ansible health-check playbooks.
+
+## Pre-Change Health (Ansible JSON)
 ```json
-{json.dumps({k: v for k, v in pre.items() if k != "_ansible_run"}, indent=2)}
+{json.dumps(pre_clean, indent=2)}
 ```
 
-## Post-Change Ansible Health Output
+## Post-Change Health (Ansible JSON)
 ```json
-{json.dumps({k: v for k, v in post.items() if k != "_ansible_run"}, indent=2)}
+{json.dumps(post_clean, indent=2)}
 ```
 
-## Computed Diff (Python)
+## Python Diff
 ```json
 {json.dumps(diff, indent=2)}
 ```
 
-## Risk Model Score
+## Risk Model
 ```json
 {json.dumps(risk, indent=2)}
 ```
 
-## Change Request
-ServiceNow Change: {change_info.get('number', 'N/A')}
+## ServiceNow Change: {change.get('number', 'N/A')}
 
 ---
 
-Your response must contain these sections:
+Respond with these sections:
 
 ### 1. DISK ANALYSIS
-Assess root and /tmp disk usage. Are levels safe? Is the delta expected?
+Root and /tmp: are levels safe? Is the delta expected for this change type?
 
-### 2. LOAD & MEMORY ANALYSIS
-Is load average acceptable? Any memory pressure introduced?
+### 2. LOAD & MEMORY
+Load average and memory: acceptable post-change?
 
 ### 3. SERVICE ANALYSIS
-List any services that changed state. Are failures critical?
+Any services that changed state? Are failures acceptable or critical?
 
-### 4. ANSIBLE PLAYBOOK ASSESSMENT
-Did the playbooks run cleanly? Any task-level concerns?
+### 4. RISK ASSESSMENT
+Agree or disagree with the risk score of {risk['score']}/100 ({risk['severity']})?
 
-### 5. RISK VERDICT
-Do you agree with the risk score of {risk['score']}/100 ({risk['severity']})?
+### 5. SERVICENOW WORK NOTES
+3-5 sentences, professional, past-tense, ready to paste into ServiceNow.
 
-### 6. SERVICENOW WORK NOTES
-Write 3-5 sentences suitable for pasting directly into ServiceNow work notes.
-Professional, factual, past-tense.
-
-### 7. FINAL VERDICT
+### 6. FINAL VERDICT
 End with exactly one of:
 `VALIDATION: PASS`
 `VALIDATION: FAIL`
 
-If FAIL — list the specific issues that must be resolved before closing the change."""
+If FAIL — list exact remediation steps."""
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
         max_tokens=1500,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
     )
 
-    text    = response.choices[0].message.content or ""
+    text    = response.content[0].text
     verdict = "PASS" if "VALIDATION: PASS" in text.upper() else "FAIL"
 
-    # Extract ServiceNow work notes section
     sn_notes = text
-    if "### 6. SERVICENOW WORK NOTES" in text:
+    if "### 5. SERVICENOW WORK NOTES" in text:
         try:
-            sn_notes = text.split("### 6. SERVICENOW WORK NOTES")[1].split("### 7.")[0].strip()
+            sn_notes = text.split("### 5. SERVICENOW WORK NOTES")[1].split("### 6.")[0].strip()
         except Exception:
-            sn_notes = text[:500]
+            sn_notes = text[:600]
 
     return {
-        "verdict":      verdict,
+        "verdict":       verdict,
         "full_analysis": text,
-        "sn_notes":     sn_notes,
-        "model":        response.model,
-        "tokens":       (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0),
+        "sn_notes":      sn_notes,
+        "model":         response.model,
+        "tokens":        response.usage.input_tokens + response.usage.output_tokens,
     }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLEANUP — runs ansible cleanup or direct remote kill
-# ══════════════════════════════════════════════════════════════════════════════
-
-def cleanup(scenario: str) -> str:
-    """Clean up temp files and processes left by the change scenario."""
-    cmds = [
-        "rm -f /tmp/ai_small.bin /tmp/ai_large.bin",
-        "if [ -f /tmp/stress_pids.txt ]; then kill -9 $(cat /tmp/stress_pids.txt) 2>/dev/null; rm -f /tmp/stress_pids.txt; fi",
-        "rm -f /tmp/pre_health.json /tmp/post_health.json /tmp/change_applied.json",
-    ]
-    if scenario == "Stop a Service (FAIL)":
-        cmds.append("sudo systemctl start chronyd 2>/dev/null || true")
-
-    results = []
-    for cmd in cmds:
-        out, err, rc = _run(cmd, timeout=30)
-        results.append({"cmd": cmd, "rc": rc, "out": out})
-
-    return results
