@@ -92,6 +92,9 @@ with col2:
     if st.session_state.change:
         st.info(f"**{st.session_state.change['number']}** | `{st.session_state.change['sys_id']}`")
 
+# ADD DEBUG HERE
+        st.write("DEBUG Change Object:", st.session_state.change)
+
 # ── Step 2: Pre-Check ─────────────────────────────────────────────────────────
 
 st.header("2️⃣ Pre-Change Health Check")
