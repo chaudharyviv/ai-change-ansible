@@ -45,6 +45,12 @@ def _secret(key: str) -> str:
     except Exception:
         return os.getenv(key, "")
 
+_WORKFLOW_IDS = {
+    "pre_health_check.yml": "237876997",
+    "apply_change.yml":     "237876994",
+    "post_health_check.yml": "237876991",
+    "cleanup.yml":          "237876988",
+
 
 # ── GitHub API base ───────────────────────────────────────────────────────────
 
@@ -70,29 +76,26 @@ def _repo() -> str:
 # GITHUB ACTIONS — trigger, poll, download
 # ══════════════════════════════════════════════════════════════════════════════
 
-def trigger_workflow(workflow_filename: str, inputs: dict) -> str:
+def trigger_workflow(workflow_id: str, inputs: dict) -> str:
     """
     Dispatch a workflow_dispatch event to GitHub Actions.
     Returns the run_id of the triggered run (fetched immediately after dispatch).
     """
     repo    = _repo()
     headers = _gh_headers()
-
-    # Record time just before dispatch so we can find this specific run
     before_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    workflow_id = _WORKFLOW_IDS.get(workflow_filename, workflow_filename)
+
     r = requests.post(
-        f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_filename}/dispatches",
+        f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
         headers=headers,
         json={"ref": "main", "inputs": inputs},
         timeout=15,
     )
     if r.status_code != 204:
-        raise RuntimeError(
-            f"GitHub dispatch failed ({r.status_code}): {r.text}"
-        )
+        raise RuntimeError(f"GitHub dispatch failed ({r.status_code}): {r.text}")
 
-    # Give GitHub 3s to register the run, then find its run_id
     time.sleep(3)
     run_id = _find_run_id(workflow_filename, before_ts)
     return run_id

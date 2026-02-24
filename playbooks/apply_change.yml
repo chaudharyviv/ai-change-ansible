@@ -32,8 +32,8 @@
       changed_when: true
 
     # ── large_disk: 2GB write → FAIL ───────────────────────────
-    - name: "[large_disk] Write 2GB to /tmp"
-      command: dd if=/dev/zero of={{ temp_large }} bs=1M count=2000 status=none
+    - name: "[large_disk] Write 2GB to /var/tmp"
+      command: dd if=/dev/zero of=/var/tmp/ai_large.bin bs=1M count=2000 status=none
       when: scenario == "large_disk"
       changed_when: true
       async: 300
