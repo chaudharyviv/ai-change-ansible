@@ -37,7 +37,7 @@
       changed_when: false
 
     - name: Parse /tmp disk percent
-      shell: df /tmp | tail -1 | awk '{print $5}' | tr -d '%'
+      shell: df -h | grep tmpfs | grep -v '/dev/shm\|/run\|/sys' | head -1 | awk '{print $5}' | tr -d '%'
       register: tmp_pct
       changed_when: false
 

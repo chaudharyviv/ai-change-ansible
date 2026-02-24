@@ -30,7 +30,7 @@ jobs:
           ssh -i ~/.ssh/oracle.pem \
               -o StrictHostKeyChecking=no \
               ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }} \
-              "rm -f /tmp/ai_small.bin /tmp/ai_large.bin /tmp/pre_health.json /tmp/post_health.json /tmp/change_applied.json"
+              "rm -f /tmp/ai_small.bin /var/tmp/ai_large.bin /tmp/pre_health.json /tmp/post_health.json /tmp/change_applied.json"
 
       - name: Kill CPU stress processes
         if: ${{ github.event.inputs.scenario == 'cpu_stress' }}
