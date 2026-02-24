@@ -1,0 +1,68 @@
+name: apply_change
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Change scenario"
+        required: true
+        type: choice
+        options:
+          - small_disk
+          - large_disk
+          - cpu_stress
+          - stop_service
+      change_number:
+        description: "ServiceNow Change Number"
+        required: true
+
+jobs:
+  apply_change:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout playbooks
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" > ~/.ssh/oracle.pem
+          chmod 600 ~/.ssh/oracle.pem
+          ssh-keyscan -H ${{ secrets.ORACLE_VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Write Ansible inventory
+        run: |
+          cat > /tmp/inventory.ini << EOF
+          [managed]
+          oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
+                    ansible_user=${{ secrets.ORACLE_VM_USER }} \
+                    ansible_ssh_private_key_file=~/.ssh/oracle.pem \
+                    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+      - name: Run apply_change.yml
+        run: |
+          ansible-playbook playbooks/apply_change.yml \
+            -i /tmp/inventory.ini \
+            -e "scenario=${{ github.event.inputs.scenario }}" \
+            -e "change_number=${{ github.event.inputs.change_number }}"
+
+      - name: Fetch change_applied.json from Oracle VM
+        run: |
+          scp -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }}:/tmp/change_applied.json \
+              ./change_applied.json
+          cat change_applied.json | python3 -m json.tool
+
+      - name: Upload change_applied.json as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: change_applied
+          path: change_applied.json
+          retention-days: 1

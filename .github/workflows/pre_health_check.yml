@@ -1,0 +1,61 @@
+name: pre_health_check
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_number:
+        description: "ServiceNow Change Number"
+        required: true
+
+jobs:
+  pre_health:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout playbooks
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          pip install ansible
+          ansible --version
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" > ~/.ssh/oracle.pem
+          chmod 600 ~/.ssh/oracle.pem
+          ssh-keyscan -H ${{ secrets.ORACLE_VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Write Ansible inventory
+        run: |
+          cat > /tmp/inventory.ini << EOF
+          [managed]
+          oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
+                    ansible_user=${{ secrets.ORACLE_VM_USER }} \
+                    ansible_ssh_private_key_file=~/.ssh/oracle.pem \
+                    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+      - name: Run pre_health_check.yml
+        run: |
+          ansible-playbook playbooks/pre_health_check.yml \
+            -i /tmp/inventory.ini \
+            -e "change_number=${{ github.event.inputs.change_number }}"
+
+      - name: Fetch result JSON from Oracle VM
+        run: |
+          scp -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }}:/tmp/pre_health.json \
+              ./pre_health.json
+          echo "=== pre_health.json preview ==="
+          cat pre_health.json | python3 -m json.tool | head -40
+
+      - name: Upload pre_health.json as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre_health
+          path: pre_health.json
+          retention-days: 1

@@ -1,0 +1,56 @@
+name: cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Scenario that was run (for service restart)"
+        required: true
+        type: choice
+        options:
+          - small_disk
+          - large_disk
+          - cpu_stress
+          - stop_service
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" > ~/.ssh/oracle.pem
+          chmod 600 ~/.ssh/oracle.pem
+
+      - name: Remove temp files
+        run: |
+          ssh -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }} \
+              "rm -f /tmp/ai_small.bin /tmp/ai_large.bin /tmp/pre_health.json /tmp/post_health.json /tmp/change_applied.json"
+
+      - name: Kill CPU stress processes
+        if: ${{ github.event.inputs.scenario == 'cpu_stress' }}
+        run: |
+          ssh -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }} \
+              "if [ -f /tmp/stress_pids.txt ]; then kill -9 \$(cat /tmp/stress_pids.txt) 2>/dev/null; rm -f /tmp/stress_pids.txt; fi"
+
+      - name: Restart stopped service
+        if: ${{ github.event.inputs.scenario == 'stop_service' }}
+        run: |
+          ssh -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }} \
+              "sudo systemctl start chronyd"
+
+      - name: Confirm clean state
+        run: |
+          ssh -i ~/.ssh/oracle.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }} \
+              "df -h / && cat /proc/loadavg && free -m"
