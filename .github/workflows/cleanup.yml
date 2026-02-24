@@ -22,7 +22,7 @@ jobs:
       - name: Write SSH private key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" > ~/.ssh/oracle.pem
+          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/oracle.pem
           chmod 600 ~/.ssh/oracle.pem
 
       - name: Remove temp files

@@ -21,22 +21,28 @@ jobs:
           pip install ansible
           ansible --version
 
-      - name: Write SSH private key
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" > ~/.ssh/oracle.pem
+          chmod 700 ~/.ssh
+
+          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/oracle.pem
           chmod 600 ~/.ssh/oracle.pem
+
           ssh-keyscan -H ${{ secrets.ORACLE_VM_HOST }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          echo "SSH setup successful"
 
       - name: Write Ansible inventory
         run: |
-          cat > /tmp/inventory.ini << EOF
-          [managed]
-          oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
-                    ansible_user=${{ secrets.ORACLE_VM_USER }} \
-                    ansible_ssh_private_key_file=~/.ssh/oracle.pem \
-                    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-          EOF
+          cat > /tmp/inventory.ini <<'EOF'
+[managed]
+oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
+          ansible_user=${{ secrets.ORACLE_VM_USER }} \
+          ansible_ssh_private_key_file=~/.ssh/oracle.pem \
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+EOF
 
       - name: Run pre_health_check.yml
         run: |

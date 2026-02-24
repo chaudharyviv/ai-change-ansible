@@ -165,6 +165,8 @@ def download_artifact(run_id, artifact_name):
 
 # ── ServiceNow ────────────────────────────────────────────────────────────────
 
+# ── ServiceNow (Safe & Consistent) ───────────────────────────────────────────
+
 def _sn():
     instance = _secret("SERVICENOW_INSTANCE")
     user     = _secret("SERVICENOW_USER")
@@ -175,51 +177,121 @@ def _sn():
 
 
 def create_change():
+    """
+    Always creates a NEW change and returns number + sys_id.
+    """
+
     instance, user, password = _sn()
+
+    payload = {
+        "short_description":  "AI-Governed Linux Change (Ansible + GitHub Actions)",
+        "description":        "Automated pre/post Ansible health validation via OPENAI.",
+        "type":               "normal",
+        "state":              "-1",  # New
+        "assigned_to":        "admin",
+        "planned_start_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "planned_end_date":   datetime.utcnow().strftime("%Y-%m-%d 23:59:59"),
+    }
+
     r = requests.post(
         f"https://{instance}/api/now/table/change_request",
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
-        json={
-            "short_description":  "AI-Governed Linux Change (Ansible + GitHub Actions)",
-            "description":        "Automated pre/post Ansible health validation via OPENAI AI.",
-            "type":               "normal",
-            "state":              "-1",
-            "assigned_to":        "admin",
-            "planned_start_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "planned_end_date":   datetime.utcnow().strftime("%Y-%m-%d ") + "23:59:59",
-        },
-        timeout=15,
+        json=payload,
+        timeout=20,
     )
     r.raise_for_status()
+
     result = r.json()["result"]
-    return {"number": result["number"], "sys_id": result["sys_id"]}
+
+    return {
+        "number": result["number"],
+        "sys_id": result["sys_id"],
+        "state":  result.get("state"),
+    }
+
+
+def _get_change(sys_id):
+    """
+    Fetches change from ServiceNow to verify state before update.
+    """
+
+    instance, user, password = _sn()
+
+    r = requests.get(
+        f"https://{instance}/api/now/table/change_request/{sys_id}",
+        auth=(user, password),
+        headers={"Accept": "application/json"},
+        timeout=20,
+    )
+    r.raise_for_status()
+
+    return r.json()["result"]
 
 
 def update_change(sys_id, notes, state=None):
+    """
+    Updates ONLY if change is active and not closed.
+    Prevents 403 from closed records.
+    """
+
     instance, user, password = _sn()
+
+    # Validate change exists
+    record = _get_change(sys_id)
+
+    if not record:
+        raise RuntimeError(f"Change {sys_id} not found.")
+
+    if str(record.get("active")).lower() == "false":
+        raise RuntimeError(
+            f"Refusing to update closed change: {record.get('number')}"
+        )
+
     payload = {"work_notes": notes}
+
     if state:
         payload["state"] = state
-    requests.patch(
+
+    r = requests.patch(
         f"https://{instance}/api/now/table/change_request/{sys_id}",
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json=payload,
-        timeout=15,
-    ).raise_for_status()
+        timeout=20,
+    )
+
+    if r.status_code == 403:
+        raise RuntimeError(
+            f"403 Forbidden while updating {record.get('number')}. "
+            f"Check ACL or state restrictions."
+        )
+
+    r.raise_for_status()
+
+    return r.json()["result"]
 
 
 def attach_file(sys_id, filename, data):
+    """
+    Attach JSON file to the SAME change record.
+    """
+
     instance, user, password = _sn()
-    requests.post(
+
+    r = requests.post(
         f"https://{instance}/api/now/attachment/file"
         f"?table_name=change_request&table_sys_id={sys_id}&file_name={filename}",
         auth=(user, password),
         headers={"Content-Type": "application/octet-stream", "Accept": "application/json"},
         data=json.dumps(data, indent=2).encode(),
-        timeout=15,
-    ).raise_for_status()
+        timeout=20,
+    )
+
+    r.raise_for_status()
+
+    return True
+
 
 
 # ── Step functions ────────────────────────────────────────────────────────────
