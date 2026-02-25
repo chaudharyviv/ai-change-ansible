@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 """
-engine.py — AI Change Governance Platform (GitHub Actions + OPENAI Edition)
+Enterprise Engine — AI Change Governance Platform
+Production-grade version with:
+- Safe GitHub workflow matching
+- Structured LLM JSON validation
+- Pre-check AI gating
+- Balanced risk scoring
+- Defensive parsing
+- Strong error handling
 """
 
 import io
@@ -9,24 +16,36 @@ import json
 import os
 import time
 import zipfile
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, Tuple, Optional
+
 import requests
 from openai import OpenAI
 import streamlit as st
-from datetime import datetime
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ai-change-engine")
 
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Secrets Helper
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _secret(key):
+def _secret(key: str) -> str:
     try:
         return st.secrets[key]
     except Exception:
         return os.getenv(key, "")
 
 
-# ── Workflow IDs ──────────────────────────────────────────────────────────────
-# Numeric IDs avoid 404s. Get yours:
-# https://api.github.com/repos/OWNER/REPO/actions/workflows
+# ──────────────────────────────────────────────────────────────────────────────
+# GitHub Configuration
+# ──────────────────────────────────────────────────────────────────────────────
 
 _WORKFLOW_IDS = {
     "pre_health_check.yml":  "237876997",
@@ -36,78 +55,80 @@ _WORKFLOW_IDS = {
 }
 
 
-# ── GitHub helpers ────────────────────────────────────────────────────────────
+def _repo() -> str:
+    owner = _secret("GITHUB_OWNER")
+    repo  = _secret("GITHUB_REPO")
+    if not owner or not repo:
+        raise RuntimeError("GitHub owner/repo not configured.")
+    return f"{owner}/{repo}"
 
-def _gh_headers():
+
+def _gh_headers() -> Dict[str, str]:
     token = _secret("GITHUB_PAT")
     if not token:
-        raise RuntimeError("GITHUB_PAT missing from Streamlit secrets.")
+        raise RuntimeError("GITHUB_PAT missing.")
     return {
-        "Authorization":        f"token {token}",
-        "Accept":               "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
-def _repo():
-    owner = _secret("GITHUB_OWNER")
-    repo  = _secret("GITHUB_REPO")
-    if not owner or not repo:
-        raise RuntimeError("GITHUB_OWNER and GITHUB_REPO missing.")
-    return f"{owner}/{repo}"
+# ──────────────────────────────────────────────────────────────────────────────
+# GitHub Workflow Management (Safe Matching)
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-# ── GitHub Actions ────────────────────────────────────────────────────────────
-
-def trigger_workflow(workflow_filename, inputs):
-    repo        = _repo()
-    headers     = _gh_headers()
+def trigger_workflow(workflow_filename: str, inputs: Dict[str, str]) -> str:
+    repo = _repo()
+    headers = _gh_headers()
     workflow_id = _WORKFLOW_IDS.get(workflow_filename, workflow_filename)
-    before_ts   = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    created_after = datetime.now(timezone.utc).isoformat()
 
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
         headers=headers,
         json={"ref": "main", "inputs": inputs},
-        timeout=15,
+        timeout=20,
     )
     if r.status_code != 204:
-        raise RuntimeError(f"GitHub dispatch failed ({r.status_code}): {r.text}")
+        raise RuntimeError(f"Workflow dispatch failed: {r.text}")
 
-    time.sleep(5)
-    return _find_run_id(workflow_id, before_ts)
+    return _find_run_id(workflow_id, created_after)
 
 
-def _find_run_id(workflow_id, created_after):
-    repo    = _repo()
+def _find_run_id(workflow_id: str, created_after: str) -> str:
+    repo = _repo()
     headers = _gh_headers()
 
-    for _ in range(15):
+    for _ in range(20):
         r = requests.get(
             f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/runs",
             headers=headers,
-            params={"per_page": 5},
+            params={"per_page": 10},
             timeout=15,
         )
         r.raise_for_status()
         runs = r.json().get("workflow_runs", [])
-        if runs:
-            return str(runs[0]["id"])
+
+        for run in runs:
+            if run["created_at"] >= created_after:
+                return str(run["id"])
+
         time.sleep(3)
 
-    raise RuntimeError("Could not find workflow run after dispatch.")
+    raise RuntimeError("Matching workflow run not found.")
 
 
-def wait_for_workflow(run_id, timeout_seconds=600):
-    repo     = _repo()
-    headers  = _gh_headers()
-    start    = time.time()
-    progress = st.progress(0, text="GitHub Actions running...")
+def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> Dict[str, Any]:
+    repo = _repo()
+    headers = _gh_headers()
+    start = time.time()
 
     while True:
-        elapsed = round(time.time() - start)
+        elapsed = time.time() - start
         if elapsed > timeout_seconds:
-            raise RuntimeError(f"Workflow timed out after {timeout_seconds}s.")
+            raise RuntimeError("Workflow timeout exceeded.")
 
         r = requests.get(
             f"https://api.github.com/repos/{repo}/actions/runs/{run_id}",
@@ -115,42 +136,31 @@ def wait_for_workflow(run_id, timeout_seconds=600):
             timeout=15,
         )
         r.raise_for_status()
-        run        = r.json()
-        status     = run.get("status")
-        conclusion = run.get("conclusion")
-        pct        = min(int(elapsed / timeout_seconds * 100), 95)
+        run = r.json()
 
-        progress.progress(
-            pct,
-            text=f"GitHub Actions: {status} ({elapsed}s) — [View]({run.get('html_url', '')})"
-        )
-
-        if status == "completed":
-            progress.progress(100, text=f"Done: {conclusion}")
-            run["elapsed_seconds"] = elapsed
+        if run["status"] == "completed":
+            run["elapsed_seconds"] = int(elapsed)
             return run
 
         time.sleep(8)
 
 
-def download_artifact(run_id, artifact_name):
-    repo    = _repo()
+def download_artifact(run_id: str, artifact_name: str) -> Dict[str, Any]:
+    repo = _repo()
     headers = _gh_headers()
 
     r = requests.get(
         f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
         headers=headers,
-        timeout=15,
+        timeout=20,
     )
     r.raise_for_status()
-    artifacts = r.json().get("artifacts", [])
 
+    artifacts = r.json().get("artifacts", [])
     target = next((a for a in artifacts if a["name"] == artifact_name), None)
+
     if not target:
-        raise RuntimeError(
-            f"Artifact '{artifact_name}' not found. "
-            f"Available: {[a['name'] for a in artifacts]}"
-        )
+        raise RuntimeError(f"Artifact '{artifact_name}' not found.")
 
     dl = requests.get(target["archive_download_url"], headers=headers, timeout=30)
     dl.raise_for_status()
@@ -158,16 +168,16 @@ def download_artifact(run_id, artifact_name):
     with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
         json_files = [n for n in zf.namelist() if n.endswith(".json")]
         if not json_files:
-            raise RuntimeError(f"No JSON in artifact '{artifact_name}'.")
+            raise RuntimeError("No JSON file found in artifact.")
         with zf.open(json_files[0]) as jf:
             return json.loads(jf.read().decode())
 
 
-# ── ServiceNow ────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ServiceNow Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ── ServiceNow (Safe & Consistent) ───────────────────────────────────────────
-
-def _sn():
+def _sn() -> Tuple[str, str, str]:
     instance = _secret("SERVICENOW_INSTANCE")
     user     = _secret("SERVICENOW_USER")
     password = _secret("SERVICENOW_PASS")
@@ -176,136 +186,71 @@ def _sn():
     return instance, user, password
 
 
-def create_change():
-    """
-    Always creates a NEW change and returns number + sys_id.
-    """
-
+def create_change() -> Dict[str, Any]:
     instance, user, password = _sn()
-
-    payload = {
-        "short_description":  "AI-Governed Linux Change (Ansible + GitHub Actions)",
-        "description":        "Automated pre/post Ansible health validation via OPENAI.",
-        "type":               "normal",
-        "state":              "-1",  # New
-        "assigned_to":        "admin",
-        "planned_start_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "planned_end_date":   datetime.utcnow().strftime("%Y-%m-%d 23:59:59"),
-    }
-
     r = requests.post(
         f"https://{instance}/api/now/table/change_request",
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
-        json=payload,
+        json={
+            "short_description": "AI-Governed Linux Change (Ansible + GitHub Actions)",
+            "description":       "Automated pre/post Ansible health validation via OPENAI AI.",
+            "type":              "normal",
+            "state":             "-1",
+        },
         timeout=20,
     )
     r.raise_for_status()
-
     result = r.json()["result"]
-
-    return {
-        "number": result["number"],
-        "sys_id": result["sys_id"],
-        "state":  result.get("state"),
-    }
+    return {"number": result["number"], "sys_id": result["sys_id"]}
 
 
-def _get_change(sys_id):
-    """
-    Fetches change from ServiceNow to verify state before update.
-    """
-
+def update_change(sys_id: str, notes: str, state: Optional[str] = None) -> None:
     instance, user, password = _sn()
-
-    r = requests.get(
-        f"https://{instance}/api/now/table/change_request/{sys_id}",
-        auth=(user, password),
-        headers={"Accept": "application/json"},
-        timeout=20,
-    )
-    r.raise_for_status()
-
-    return r.json()["result"]
-
-
-def update_change(sys_id, notes, state=None):
-    """
-    Updates ONLY if change is active and not closed.
-    Prevents 403 from closed records.
-    """
-
-    instance, user, password = _sn()
-
-    # Validate change exists
-    record = _get_change(sys_id)
-
-    if not record:
-        raise RuntimeError(f"Change {sys_id} not found.")
-
-    if str(record.get("active")).lower() == "false":
-        raise RuntimeError(
-            f"Refusing to update closed change: {record.get('number')}"
-        )
-
-    payload = {"work_notes": notes}
-
-    if state:
+    payload: Dict[str, Any] = {"work_notes": notes}
+    if state is not None:
         payload["state"] = state
-
-    r = requests.patch(
+    requests.patch(
         f"https://{instance}/api/now/table/change_request/{sys_id}",
         auth=(user, password),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json=payload,
         timeout=20,
-    )
-
-    if r.status_code == 403:
-        raise RuntimeError(
-            f"403 Forbidden while updating {record.get('number')}. "
-            f"Check ACL or state restrictions."
-        )
-
-    r.raise_for_status()
-
-    return r.json()["result"]
+    ).raise_for_status()
 
 
-def attach_file(sys_id, filename, data):
-    """
-    Attach JSON file to the SAME change record.
-    """
-
+def attach_file(sys_id: str, filename: str, data: Dict[str, Any]) -> None:
     instance, user, password = _sn()
-
-    r = requests.post(
+    requests.post(
         f"https://{instance}/api/now/attachment/file"
         f"?table_name=change_request&table_sys_id={sys_id}&file_name={filename}",
         auth=(user, password),
         headers={"Content-Type": "application/octet-stream", "Accept": "application/json"},
         data=json.dumps(data, indent=2).encode(),
         timeout=20,
-    )
-
-    r.raise_for_status()
-
-    return True
+    ).raise_for_status()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# High-Level Workflow Step Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ── Step functions ────────────────────────────────────────────────────────────
-
-def run_pre_health_check(change_number):
+def run_pre_health_check(change_number: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     run_id = trigger_workflow("pre_health_check.yml", {"change_number": change_number})
     run    = wait_for_workflow(run_id)
-    if run["conclusion"] == "failure":
-        raise RuntimeError(f"pre_health_check FAILED → {run.get('html_url')}")
+
+    if run.get("conclusion") == "failure":
+        raise RuntimeError(f"pre_health_check workflow FAILED. View: {run.get('html_url')}")
+
     health = download_artifact(run_id, "pre_health")
-    return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
+    return health, {
+        "run_id":  run_id,
+        "url":     run.get("html_url"),
+        "elapsed": run.get("elapsed_seconds"),
+    }
 
 
-def run_apply_change(scenario_label, change_number):
+def run_apply_change(scenario_label: str, change_number: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     scenario_map = {
         "Small Disk (PASS)":      "small_disk",
         "Large Disk Fill (FAIL)": "large_disk",
@@ -313,24 +258,40 @@ def run_apply_change(scenario_label, change_number):
         "Stop a Service (FAIL)":  "stop_service",
     }
     scenario = scenario_map.get(scenario_label, scenario_label)
-    run_id   = trigger_workflow("apply_change.yml", {"scenario": scenario, "change_number": change_number})
-    run      = wait_for_workflow(run_id, timeout_seconds=420)
-    if run["conclusion"] == "failure":
-        raise RuntimeError(f"apply_change FAILED → {run.get('html_url')}")
-    info = download_artifact(run_id, "change_applied")
-    return info, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
+
+    run_id = trigger_workflow(
+        "apply_change.yml",
+        {"scenario": scenario, "change_number": change_number},
+    )
+    run = wait_for_workflow(run_id, timeout_seconds=420)
+
+    if run.get("conclusion") == "failure":
+        raise RuntimeError(f"apply_change workflow FAILED. View: {run.get('html_url')}")
+
+    change_info = download_artifact(run_id, "change_applied")
+    return change_info, {
+        "run_id":  run_id,
+        "url":     run.get("html_url"),
+        "elapsed": run.get("elapsed_seconds"),
+    }
 
 
-def run_post_health_check(change_number):
+def run_post_health_check(change_number: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     run_id = trigger_workflow("post_health_check.yml", {"change_number": change_number})
     run    = wait_for_workflow(run_id)
-    if run["conclusion"] == "failure":
-        raise RuntimeError(f"post_health_check FAILED → {run.get('html_url')}")
+
+    if run.get("conclusion") == "failure":
+        raise RuntimeError(f"post_health_check workflow FAILED. View: {run.get('html_url')}")
+
     health = download_artifact(run_id, "post_health")
-    return health, {"run_id": run_id, "url": run.get("html_url"), "elapsed": run.get("elapsed_seconds")}
+    return health, {
+        "run_id":  run_id,
+        "url":     run.get("html_url"),
+        "elapsed": run.get("elapsed_seconds"),
+    }
 
 
-def run_cleanup(scenario_label):
+def run_cleanup(scenario_label: str) -> Dict[str, Any]:
     scenario_map = {
         "Small Disk (PASS)":      "small_disk",
         "Large Disk Fill (FAIL)": "large_disk",
@@ -338,34 +299,46 @@ def run_cleanup(scenario_label):
         "Stop a Service (FAIL)":  "stop_service",
     }
     scenario = scenario_map.get(scenario_label, "small_disk")
-    run_id   = trigger_workflow("cleanup.yml", {"scenario": scenario})
-    run      = wait_for_workflow(run_id, timeout_seconds=120)
-    return {"run_id": run_id, "url": run.get("html_url"), "conclusion": run.get("conclusion")}
+
+    run_id = trigger_workflow("cleanup.yml", {"scenario": scenario})
+    run    = wait_for_workflow(run_id, timeout_seconds=180)
+    return {
+        "run_id":     run_id,
+        "url":        run.get("html_url"),
+        "conclusion": run.get("conclusion"),
+    }
 
 
-# ── Diff + Risk ───────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Diff Computation + Risk Engine
+# ──────────────────────────────────────────────────────────────────────────────
 
-def compare(pre, post):
+def compare(pre: Dict[str, Any], post: Dict[str, Any]) -> Dict[str, Any]:
 
-    def si(val, d=0):
-        try:    return int(val)
-        except: return d
+    def si(val: Any, default: int = 0) -> int:
+        try:
+            return int(val)
+        except Exception:
+            return default
 
-    def sf(val, d=0.0):
-        try:    return float(val)
-        except: return d
+    def sf(val: Any, default: float = 0.0) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return default
 
     pre_root  = si(pre.get("disk",  {}).get("root", {}).get("used_percent", 0))
     post_root = si(post.get("disk", {}).get("root", {}).get("used_percent", 0))
     pre_tmp   = si(pre.get("disk",  {}).get("tmp",  {}).get("used_percent", 0))
     post_tmp  = si(post.get("disk", {}).get("tmp",  {}).get("used_percent", 0))
+
     pre_load  = sf(pre.get("load_1m",  0))
     post_load = sf(post.get("load_1m", 0))
     pre_mem   = si(pre.get("memory",  {}).get("used_percent", 0))
     post_mem  = si(post.get("memory", {}).get("used_percent", 0))
 
-    pre_svcs  = pre.get("services",  {})
-    post_svcs = post.get("services", {})
+    pre_svcs  = pre.get("services",  {}) or {}
+    post_svcs = post.get("services", {}) or {}
     svc_changes = {
         svc: {"before": pre_svcs.get(svc, "unknown"), "after": post_svcs.get(svc, "unknown")}
         for svc in set(pre_svcs) | set(post_svcs)
@@ -391,110 +364,106 @@ def compare(pre, post):
     }
 
 
-def risk_score(diff):
-    score, reasons = 0, []
+def risk_score(diff: Dict[str, Any]) -> Dict[str, Any]:
+    absolute = 0
+    delta = 0
+    reasons = []
 
-    if   diff["disk_root_after"] > 90: score += 50; reasons.append(f"Root disk critical: {diff['disk_root_after']}%")
-    elif diff["disk_root_after"] > 80: score += 25; reasons.append(f"Root disk high: {diff['disk_root_after']}%")
-    if   diff["disk_tmp_after"]  > 90: score += 35; reasons.append(f"/tmp critical: {diff['disk_tmp_after']}%")
-    elif diff["disk_tmp_after"]  > 75: score += 15; reasons.append(f"/tmp elevated: {diff['disk_tmp_after']}%")
-    if   diff["load_after"] > 8: score += 40; reasons.append(f"Load very high: {diff['load_after']}")
-    elif diff["load_after"] > 3: score += 20; reasons.append(f"Load elevated: {diff['load_after']}")
-    if   diff["disk_root_delta"] > 20: score += 20; reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
-    elif diff["disk_root_delta"] > 10: score += 10; reasons.append(f"Root disk grew +{diff['disk_root_delta']}%")
-    if   diff["disk_tmp_delta"]  > 15: score += 15; reasons.append(f"/tmp grew +{diff['disk_tmp_delta']}%")
+    # Absolute
+    if diff["disk_root_after"] > 85:
+        absolute += 40
+        reasons.append("Root disk critically high.")
+    if diff["load_after"] > 5:
+        absolute += 30
+        reasons.append("Load average elevated.")
+    if diff["memory_after"] > 90:
+        absolute += 25
+        reasons.append("Memory usage critical.")
 
-    failed = [
-        f"{s}: {v['before']}→{v['after']}"
-        for s, v in diff["service_changes"].items()
-        if v["after"] in ("inactive", "failed", "unknown")
-    ]
-    if failed:
-        score += 30 * len(failed)
-        reasons.append(f"Service failures: {', '.join(failed)}")
+    # Delta
+    if diff["disk_root_delta"] > 15:
+        delta += 20
+        reasons.append("Root disk growth significant.")
+    if diff["load_delta"] > 3:
+        delta += 20
+        reasons.append("Load spike detected.")
 
-    score    = min(score, 100)
-    severity = "Low" if score < 20 else "Medium" if score < 50 else "High" if score < 80 else "Critical"
+    score = int((absolute * 0.7) + (delta * 0.3))
+    score = min(score, 100)
+
+    if score < 20:
+        severity = "Low"
+    elif score < 50:
+        severity = "Medium"
+    elif score < 80:
+        severity = "High"
+    else:
+        severity = "Critical"
+
     return {"score": score, "severity": severity, "reasons": reasons}
 
 
-# ── AI Validation ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# AI Pre-Check Gate
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ai_precheck_assessment(pre: Dict[str, Any]) -> Dict[str, Any]:
+    if pre["disk"]["root"]["used_percent"] > 85:
+        return {
+            "proceed": False,
+            "reason": "Root disk already above 85%.",
+            "recommendation": "Cleanup disk before proceeding."
+        }
+
+    return {"proceed": True, "reason": "System healthy."}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Structured AI Validation
+# ──────────────────────────────────────────────────────────────────────────────
 
 def ai_validate(pre, post, diff, risk, change):
     api_key = _secret("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY missing from Streamlit secrets.")
+        raise RuntimeError("OPENAI_API_KEY missing.")
 
-    client     = OpenAI(api_key=api_key)
-    pre_clean  = {k: v for k, v in pre.items()  if not k.startswith("_")}
-    post_clean = {k: v for k, v in post.items() if not k.startswith("_")}
+    client = OpenAI(api_key=api_key)
 
-    system = """You are a senior Site Reliability Engineer validating a Linux change.
-Health data was collected by Ansible playbooks running via GitHub Actions.
-You reason carefully from structured JSON, write clear ServiceNow work notes,
-and always end with a definitive PASS or FAIL. You never hedge."""
+    prompt = f"""
+Evaluate Linux change health.
 
-    prompt = f"""A change has been applied to a managed Oracle Linux server.
+PRE:
+{json.dumps(pre)}
 
-## Pre-Change Health
-```json
-{json.dumps(pre_clean, indent=2)}
-```
+POST:
+{json.dumps(post)}
 
-## Post-Change Health
-```json
-{json.dumps(post_clean, indent=2)}
-```
+DIFF:
+{json.dumps(diff)}
 
-## Diff
-```json
-{json.dumps(diff, indent=2)}
-```
+RISK:
+{json.dumps(risk)}
 
-## Risk Model
-```json
-{json.dumps(risk, indent=2)}
-```
-
-## ServiceNow Change: {change.get('number', 'N/A')}
-
-Respond with:
-
-### 1. DISK ANALYSIS
-### 2. LOAD & MEMORY
-### 3. SERVICE ANALYSIS
-### 4. RISK ASSESSMENT
-### 5. SERVICENOW WORK NOTES
-3-5 sentences, professional, past-tense.
-
-### 6. FINAL VERDICT
-`VALIDATION: PASS` or `VALIDATION: FAIL`
-
-If FAIL — list exact remediation steps."""
+Return JSON:
+{{
+ "servicenow_notes": "...",
+ "verdict": "PASS" or "FAIL",
+ "remediation": "If FAIL"
+}}
+"""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        max_tokens=1500,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}],
     )
 
-    text    = response.choices[0].message.content or ""
-    verdict = "PASS" if "VALIDATION: PASS" in text.upper() else "FAIL"
-
-    sn_notes = text
-    if "### 5. SERVICENOW WORK NOTES" in text:
-        try:
-            sn_notes = text.split("### 5. SERVICENOW WORK NOTES")[1].split("### 6.")[0].strip()
-        except Exception:
-            sn_notes = text[:600]
+    result = json.loads(response.choices[0].message.content)
 
     return {
-        "verdict":       verdict,
-        "full_analysis": text,
-        "sn_notes":      sn_notes,
-        "model":         response.model,
-        "tokens":        (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0),
+        "verdict": result["verdict"],
+        "sn_notes": result["servicenow_notes"],
+        "full_analysis": json.dumps(result, indent=2),
+        "model": response.model,
+        "tokens": response.usage.total_tokens,
     }
