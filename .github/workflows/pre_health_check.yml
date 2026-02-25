@@ -23,32 +23,11 @@ jobs:
       - name: Setup SSH (with debug)
         shell: /usr/bin/bash {0}
         run: |
-          set -xuo pipefail 
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          echo "DEBUG: Home is $HOME"
-          ls -ld ~/.ssh || true
-
-          # Write key (your secret)
-          echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/oracle.pem
-          chmod 600 ~/.ssh/oracle.pem
-
-          echo "DEBUG: Private key file size:"
-          ls -l ~/.ssh/oracle.pem || true
-
-          echo "DEBUG: Target host = '${{ secrets.ORACLE_VM_HOST }}'"
-
-          # Capture keyscan output
-          echo "DEBUG: Running ssh-keyscan ..."
-          ssh-keyscan -H "${{ secrets.ORACLE_VM_HOST }}" -t rsa,ecdsa,ed25519 >> ~/.ssh/known_hosts 2>&1 || {
-            echo "ERROR: ssh-keyscan FAILED (likely port 22 unreachable)"
-            echo "Continuing anyway (later steps may still fail)"
-          }
-
-          chmod 644 ~/.ssh/known_hosts 2>/dev/null || true
-          echo "SSH setup finished."
+         mkdir -p ~/.ssh
+         chmod 700 ~/.ssh
+         echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/oracle.pem
+         chmod 600 ~/.ssh/oracle.pem
+         echo "SSH setup done (host key verification disabled)"
 
       - name: Write Ansible inventory
         run: |
@@ -57,7 +36,7 @@ jobs:
           oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
                     ansible_user=${{ secrets.ORACLE_VM_USER }} \
                     ansible_ssh_private_key_file=~/.ssh/oracle.pem \
-                    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+                    ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
           EOF
 
       - name: Run pre_health_check.yml
