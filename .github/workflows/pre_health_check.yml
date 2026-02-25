@@ -59,7 +59,7 @@ EOF
           echo "=== pre_health.json preview ==="
           cat pre_health.json | python3 -m json.tool | head -40
 
-      - name: Upload pre_health.json as artifact
+      - name: Upload pre_health.json as an artifact to the workflow run
         uses: actions/upload-artifact@v4
         with:
           name: pre_health

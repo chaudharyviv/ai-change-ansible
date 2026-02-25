@@ -50,7 +50,7 @@ EOF
               ./post_health.json
           cat post_health.json | python3 -m json.tool | head -40
 
-      - name: Upload post_health.json as artifact
+      - name: Upload post_health.json as an artifact
         uses: actions/upload-artifact@v4
         with:
           name: post_health
