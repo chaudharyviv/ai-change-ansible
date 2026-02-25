@@ -1,4 +1,4 @@
-name: pre_health_check
+name: Pre-Health Check
 
 on:
   workflow_dispatch:
@@ -12,7 +12,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout playbooks
         uses: actions/checkout@v4
 
@@ -21,36 +20,44 @@ jobs:
           pip install ansible
           ansible --version
 
-      - name: Setup SSH
+      - name: Setup SSH (with debug)
+        shell: /usr/bin/bash {0}
         run: |
-          set -euo pipefail           # fail fast on errors + undefined vars
-          set -x    
-                            # echo commands (debug)
+          set -xuo pipefail 
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "Home directory     : $HOME"
+
+          echo "DEBUG: Home is $HOME"
           ls -ld ~/.ssh || true
-          # Write private key (remove possible Windows line endings)
+
+          # Write key (your secret)
           echo "${{ secrets.ORACLE_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/oracle.pem
           chmod 600 ~/.ssh/oracle.pem
-          ssh-keyscan -H ${{ secrets.ORACLE_VM_HOST }} >> ~/.ssh/known_hosts
-    # Try to collect host key — capture output & don't fail the whole job yet
-          ssh-keyscan -H ${{ secrets.ORACLE_VM_HOST }} >> ~/.ssh/known_hosts 2>&1 \
-            || echo "Warning: ssh-keyscan failed (host unreachable, wrong IP/domain, port 22 blocked, firewall, etc.) — StrictHostKeyChecking=no will be used later"
+
+          echo "DEBUG: Private key file size:"
+          ls -l ~/.ssh/oracle.pem || true
+
+          echo "DEBUG: Target host = '${{ secrets.ORACLE_VM_HOST }}'"
+
+          # Capture keyscan output
+          echo "DEBUG: Running ssh-keyscan ..."
+          ssh-keyscan -H "${{ secrets.ORACLE_VM_HOST }}" -t rsa,ecdsa,ed25519 >> ~/.ssh/known_hosts 2>&1 || {
+            echo "ERROR: ssh-keyscan FAILED (likely port 22 unreachable)"
+            echo "Continuing anyway (later steps may still fail)"
+          }
+
           chmod 644 ~/.ssh/known_hosts 2>/dev/null || true
-          # Show what we actually have in known_hosts
-          echo "Contents of known_hosts:"
-          cat ~/.ssh/known_hosts || echo "(file is empty or missing)"
-          echo "SSH setup finished (check lines above for clues if it failed)"
+          echo "SSH setup finished."
 
       - name: Write Ansible inventory
         run: |
           cat > /tmp/inventory.ini <<'EOF'
           [managed]
           oracle-vm ansible_host=${{ secrets.ORACLE_VM_HOST }} \
-              ansible_user=${{ secrets.ORACLE_VM_USER }} \
-              ansible_ssh_private_key_file=~/.ssh/oracle.pem \
-              ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+                    ansible_user=${{ secrets.ORACLE_VM_USER }} \
+                    ansible_ssh_private_key_file=~/.ssh/oracle.pem \
+                    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
           EOF
 
       - name: Run pre_health_check.yml
@@ -66,9 +73,9 @@ jobs:
               ${{ secrets.ORACLE_VM_USER }}@${{ secrets.ORACLE_VM_HOST }}:/tmp/pre_health.json \
               ./pre_health.json
           echo "=== pre_health.json preview ==="
-          cat pre_health.json | python3 -m json.tool | head -40
+          cat pre_health.json | python3 -m json.tool | head -n 40
 
-      - name: Upload pre_health.json as an artifact to the workflow run
+      - name: Upload pre_health.json as an artifact
         uses: actions/upload-artifact@v4
         with:
           name: pre_health
