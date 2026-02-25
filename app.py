@@ -159,11 +159,13 @@ else:
     if st.session_state.pre:
         p = st.session_state.pre
         root_pct = p.get("disk", {}).get("root", {}).get("used_percent", "N/A")
-        tmp_pct = p.get("disk", {}).get("tmp", {}).get("used_percent", "N/A")
+        mem_pct = p.get("memory", {}).get("used_percent", "N/A")
+        load_1m = p.get("load_1m", "N/A")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Root Disk", f"{root_pct}%")
-        col2.metric("/tmp", f"{tmp_pct}%")
+        col2.metric("Memory", f"{mem_pct}%")
+        col3.metric("Load (1m)", f"{load_1m}")
 
 
 # ─────────────────────────────────────────────────────────────
