@@ -47,14 +47,6 @@ def _secret(key: str) -> str:
 # GitHub Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-_WORKFLOW_IDS = {
-    "pre_health_check.yml":  "237876997",
-    "apply_change.yml":      "237876994",
-    "post_health_check.yml": "237876996",
-    "cleanup.yml":           "237876995",
-}
-
-
 def _repo() -> str:
     owner = _secret("GITHUB_OWNER")
     repo  = _secret("GITHUB_REPO")
@@ -73,6 +65,35 @@ def _gh_headers() -> Dict[str, str]:
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
+def _get_workflow_id(workflow_filename: str) -> str:
+    """
+    Dynamically get workflow ID from filename.
+    This replaces the hardcoded _WORKFLOW_IDS dictionary.
+    """
+    repo = _repo()
+    headers = _gh_headers()
+    
+    logger.info(f"Looking up workflow ID for: {workflow_filename}")
+    
+    r = requests.get(
+        f"https://api.github.com/repos/{repo}/actions/workflows",
+        headers=headers,
+        timeout=15,
+    )
+    r.raise_for_status()
+    
+    for workflow in r.json().get("workflows", []):
+        # Match by filename (e.g., "pre_health_check.yml")
+        if workflow["path"].endswith(workflow_filename):
+            workflow_id = str(workflow["id"])
+            logger.info(f"Found workflow ID {workflow_id} for {workflow_filename}")
+            return workflow_id
+    
+    raise RuntimeError(
+        f"Workflow '{workflow_filename}' not found in repository. "
+        f"Available workflows: {[w['name'] for w in r.json().get('workflows', [])]}"
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # GitHub Workflow Management (Safe Matching)
@@ -81,10 +102,14 @@ def _gh_headers() -> Dict[str, str]:
 def trigger_workflow(workflow_filename: str, inputs: Dict[str, str]) -> str:
     repo = _repo()
     headers = _gh_headers()
-    workflow_id = _WORKFLOW_IDS.get(workflow_filename, workflow_filename)
-
+    
+    # Get workflow ID dynamically
+    workflow_id = _get_workflow_id(workflow_filename)
+    
     created_after = datetime.now(timezone.utc).isoformat()
-
+    
+    logger.info(f"Triggering workflow {workflow_filename} (ID: {workflow_id})")
+    
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
         headers=headers,
@@ -93,15 +118,17 @@ def trigger_workflow(workflow_filename: str, inputs: Dict[str, str]) -> str:
     )
     if r.status_code != 204:
         raise RuntimeError(f"Workflow dispatch failed: {r.text}")
-
+    
     return _find_run_id(workflow_id, created_after)
 
 
 def _find_run_id(workflow_id: str, created_after: str) -> str:
     repo = _repo()
     headers = _gh_headers()
-
-    for _ in range(20):
+    
+    logger.info(f"Waiting for workflow run to appear (created after {created_after})")
+    
+    for attempt in range(20):
         r = requests.get(
             f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/runs",
             headers=headers,
@@ -110,15 +137,17 @@ def _find_run_id(workflow_id: str, created_after: str) -> str:
         )
         r.raise_for_status()
         runs = r.json().get("workflow_runs", [])
-
+        
         for run in runs:
             if run["created_at"] >= created_after:
-                return str(run["id"])
-
+                run_id = str(run["id"])
+                logger.info(f"Found workflow run: {run_id}")
+                return run_id
+        
+        logger.debug(f"Attempt {attempt + 1}/20: No matching run yet, waiting...")
         time.sleep(3)
-
-    raise RuntimeError("Matching workflow run not found.")
-
+    
+    raise RuntimeError("Matching workflow run not found after 60 seconds.")
 
 def wait_for_workflow(run_id: str, timeout_seconds: int = 600) -> Dict[str, Any]:
     repo = _repo()
